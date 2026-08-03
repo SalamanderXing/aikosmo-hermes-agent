@@ -153,6 +153,7 @@ from gateway.platforms.api_server_run_idempotency import RunIdempotencyStore
 from agent.redact import redact_sensitive_text
 from agent.interrupt_compat import request_hard_interrupt
 from gateway.readiness import collect_runtime_readiness
+from gateway.webhook_deliveries import get_webhook_delivery_store
 from gateway.browser_control_artifacts import (
     ArtifactError,
     ArtifactRateLimiter,
@@ -196,7 +197,6 @@ def _get_scoped_secret(name, default=None):
     except _UnscopedSecretError:
         val = os.getenv(name)
     return val if val is not None else default
-
 
 logger = logging.getLogger(__name__)
 
@@ -2219,6 +2219,11 @@ class APIServerAdapter(BasePlatformAdapter):
             ("GET", "/v1/health", self._handle_health),
             ("GET", "/v1/models", self._handle_models),
             ("GET", "/api/model/options", self._handle_model_options),
+            (
+                "GET",
+                "/api/webhook-deliveries/{delivery_id}",
+                self._handle_webhook_delivery,
+            ),
             ("GET", "/v1/capabilities", self._handle_capabilities),
             # Authenticated browser-control surface: POST registration
             # mints a short-lived ticket; the controller then opens the WS with
@@ -2268,6 +2273,29 @@ class APIServerAdapter(BasePlatformAdapter):
             # by a NAS-minted JWT (NOT API_SERVER_KEY).
             routes.append(("POST", "/api/cron/fire", self._handle_cron_fire))
         return routes
+
+    async def _handle_webhook_delivery(self, request: "web.Request") -> "web.Response":
+        """Return content-free status for a durable webhook delivery."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        delivery = get_webhook_delivery_store().get(
+            request.match_info["delivery_id"]
+        )
+        if delivery is None:
+            return web.json_response({"error": "Delivery not found"}, status=404)
+        return web.json_response(
+            {
+                "delivery_id": delivery["delivery_id"],
+                "route": delivery["route"],
+                "status": delivery["status"],
+                "session_id": delivery["session_id"],
+                "accepted_at": delivery["accepted_at"],
+                "started_at": delivery["started_at"],
+                "ended_at": delivery["ended_at"],
+                "end_reason": delivery["end_reason"],
+            }
+        )
 
     # ------------------------------------------------------------------
     # Session header helpers
