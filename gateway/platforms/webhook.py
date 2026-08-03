@@ -853,28 +853,38 @@ class WebhookAdapter(BasePlatformAdapter):
         )
 
         # ── Idempotency ─────────────────────────────────────────
-        # Persist before HTTP 202 so retries remain idempotent after restart.
+        # Routes that expose durable status persist before HTTP 202 so retries
+        # remain idempotent after restart. Other routes retain the bounded
+        # process-local cache and do not grow the durable status database.
         now = time.time()
-        request_id = request.headers.get("X-Request-ID", delivery_id)
-        delivery, created = get_webhook_delivery_store().accept(
-            route=route_name,
-            delivery_id=delivery_id,
-            request_id=request_id,
-        )
-        delivery_id = str(delivery["delivery_id"])
-        if not created:
+        if route_config.get("durable_status"):
+            request_id = request.headers.get("X-Request-ID", delivery_id)
+            delivery, created = get_webhook_delivery_store().accept(
+                route=route_name,
+                delivery_id=delivery_id,
+                request_id=request_id,
+            )
+            delivery_id = str(delivery["delivery_id"])
+            if not created:
+                logger.info(
+                    "[webhook] Skipping duplicate delivery %s", delivery_id
+                )
+                return web.json_response(
+                    {
+                        "status": delivery["status"],
+                        "delivery_id": delivery_id,
+                        "duplicate": True,
+                    },
+                    status=202,
+                )
+        elif not self._record_delivery_id(delivery_id, now):
             logger.info(
                 "[webhook] Skipping duplicate delivery %s", delivery_id
             )
             return web.json_response(
-                {
-                    "status": delivery["status"],
-                    "delivery_id": delivery_id,
-                    "duplicate": True,
-                },
-                status=202,
+                {"status": "duplicate", "delivery_id": delivery_id},
+                status=200,
             )
-        self._record_delivery_id(delivery_id, now)
 
         # ── Direct delivery mode (deliver_only) ─────────────────
         # Skip the agent entirely — the rendered prompt IS the message we
@@ -1002,6 +1012,8 @@ class WebhookAdapter(BasePlatformAdapter):
         delivery_id = event.message_id
         if not delivery_id:
             return
+        if get_webhook_delivery_store().get(delivery_id) is None:
+            return
         get_webhook_delivery_store().mark_running(delivery_id)
         task = asyncio.create_task(self._record_running_session(event, delivery_id))
         self._background_tasks.add(task)
@@ -1054,11 +1066,12 @@ class WebhookAdapter(BasePlatformAdapter):
         row, so this never clobbers a ``compression``/``agent_close`` reason.
         """
         session_id = self._resolve_webhook_session_id(event)
-        get_webhook_delivery_store().mark_ended(
-            event.message_id,
-            session_id=session_id,
-            end_reason=str(getattr(outcome, "value", outcome)).lower(),
-        )
+        if get_webhook_delivery_store().get(event.message_id) is not None:
+            get_webhook_delivery_store().mark_ended(
+                event.message_id,
+                session_id=session_id,
+                end_reason=str(getattr(outcome, "value", outcome)).lower(),
+            )
         await self._end_webhook_session(event, event.source.chat_id)
 
     async def _end_webhook_session(
