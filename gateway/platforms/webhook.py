@@ -680,17 +680,22 @@ class WebhookAdapter(BasePlatformAdapter):
                 prompt = self._apply_skills(prompt, skills)
         delivery_id = headers.get("X-GitHub-Delivery", headers.get("svix-id", headers.get(
             "webhook-id", headers.get("X-Request-ID", uuid.uuid4().hex))))
-        # Idempotency: persist before HTTP 202 so retries remain idempotent after restart.
+        # Idempotency. Routes that expose durable status persist before HTTP 202 so retries remain idempotent
+        # after restart. Other routes retain the bounded process-local cache and do not grow the durable status
+        # database.
         now = time.time()
-        request_id = headers.get("X-Request-ID", delivery_id)
-        delivery, created = get_webhook_delivery_store().accept(
-            route=route_name, delivery_id=delivery_id, request_id=request_id)
-        delivery_id = str(delivery["delivery_id"])
-        if not created:
+        if route_config.get("durable_status"):
+            request_id = headers.get("X-Request-ID", delivery_id)
+            delivery, created = get_webhook_delivery_store().accept(
+                route=route_name, delivery_id=delivery_id, request_id=request_id)
+            delivery_id = str(delivery["delivery_id"])
+            if not created:
+                logger.info("[webhook] Skipping duplicate delivery %s on route %s", delivery_id, route_name)
+                return web.json_response(
+                    {"status": delivery["status"], "delivery_id": delivery_id, "duplicate": True}, status=202)
+        elif not self._record_delivery_id(_WebhookDeliveryIdentity.from_parts(profile, route_name, delivery_id), now):
             logger.info("[webhook] Skipping duplicate delivery %s on route %s", delivery_id, route_name)
-            return web.json_response({"status": delivery["status"], "delivery_id": delivery_id, "duplicate": True},
-                                     status=202)
-        self._record_delivery_id(_WebhookDeliveryIdentity.from_parts(profile, route_name, delivery_id), now)
+            return web.json_response({"status": "duplicate", "delivery_id": delivery_id}, status=200)
         if route_config.get("cron_job"):
             return self._handle_cron_trigger(prompt, route_config, route_name, event_type, delivery_id, profile)
         if route_config.get("deliver_only"):
@@ -747,6 +752,8 @@ class WebhookAdapter(BasePlatformAdapter):
         delivery_id = event.message_id
         if not delivery_id:
             return
+        if get_webhook_delivery_store().get(delivery_id) is None:
+            return
         get_webhook_delivery_store().mark_running(delivery_id)
         task = asyncio.create_task(self._record_running_session(event, delivery_id))
         self._background_tasks.add(task)
@@ -773,8 +780,9 @@ class WebhookAdapter(BasePlatformAdapter):
         unclosed webhook sessions leak unbounded. Fires at the true end of the run; ``end_session()`` is
         first-reason-wins."""
         session_id = self._resolve_webhook_session_id(event)
-        get_webhook_delivery_store().mark_ended(
-            event.message_id, session_id=session_id, end_reason=str(getattr(outcome, "value", outcome)).lower())
+        if get_webhook_delivery_store().get(event.message_id) is not None:
+            get_webhook_delivery_store().mark_ended(
+                event.message_id, session_id=session_id, end_reason=str(getattr(outcome, "value", outcome)).lower())
         await self._end_webhook_session(event, event.source.chat_id)
 
     async def _end_webhook_session(self, event: MessageEvent, session_chat_id: str) -> None:
