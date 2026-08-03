@@ -32,9 +32,23 @@ from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import SendResult
 from gateway.platforms.webhook import (
     WebhookAdapter,
+    _resolve_config_secret,
     _INSECURE_NO_AUTH,
     check_webhook_requirements,
 )
+
+
+def test_resolve_config_secret_from_environment(monkeypatch):
+    monkeypatch.setenv("WEBHOOK_ROUTE_SECRET", "resolved-secret")
+
+    assert _resolve_config_secret("${WEBHOOK_ROUTE_SECRET}") == "resolved-secret"
+    assert _resolve_config_secret("literal-secret") == "literal-secret"
+
+
+def test_missing_config_secret_environment_variable_fails_closed(monkeypatch):
+    monkeypatch.delenv("MISSING_WEBHOOK_ROUTE_SECRET", raising=False)
+
+    assert _resolve_config_secret("${MISSING_WEBHOOK_ROUTE_SECRET}") == ""
 
 
 # ---------------------------------------------------------------------------
