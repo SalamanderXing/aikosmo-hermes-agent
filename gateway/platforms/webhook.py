@@ -159,6 +159,21 @@ def _signature_pin_error(name: str, route: dict) -> Optional[str]:
             f"{', '.join(sorted(_SIGNATURE_SCHEMES))} (or omit it to accept every supported scheme).")
 
 
+def _resolve_config_secret(value: object) -> str:
+    """Resolve an exact ``${ENV_VAR}`` secret reference without interpolation.
+
+    The config loader already expands ``${VAR}`` it can resolve, but leaves an unset one as the literal
+    placeholder — a usable-looking HMAC secret. Resolving it here to ``""`` makes a missing variable fail
+    closed; it also covers dynamic routes, which the config loader never expands."""
+    if not isinstance(value, str):
+        return ""
+    if value.startswith("${") and value.endswith("}"):
+        name = value[2:-1]
+        if name and name.replace("_", "").isalnum():
+            return os.environ.get(name, "")
+    return value
+
+
 def _json_error(message: str, status: int) -> web.Response:
     return web.json_response({"error": message}, status=status)
 
@@ -214,7 +229,7 @@ class WebhookAdapter(BasePlatformAdapter):
         # Empty string / null host normalises to None ("bind all families").
         self._host: Optional[str] = extra.get("host", DEFAULT_HOST) or None
         self._port: int = int(extra.get("port", DEFAULT_PORT))
-        self._global_secret: str = extra.get("secret", "")
+        self._global_secret: str = _resolve_config_secret(extra.get("secret", ""))
         self._static_routes: dict[str, dict] = extra.get("routes", {})
         self._dynamic_routes: dict[str, dict] = {}
         self._dynamic_routes_stat: Optional[tuple] = None
@@ -252,7 +267,7 @@ class WebhookAdapter(BasePlatformAdapter):
 
     def _validate_route(self, name: str, route: dict) -> None:
         """Startup validation: secret required; INSECURE_NO_AUTH only on loopback (crash early on a public footgun)."""
-        secret = route.get("secret", self._global_secret)
+        secret = _resolve_config_secret(route.get("secret", self._global_secret))
         if not _is_usable_secret(secret):
             raise ValueError(f"[webhook] Route '{name}' HMAC secret is missing, blank, or not a string. Set 'secret' "
                              f"on the route or globally. "
@@ -417,7 +432,7 @@ class WebhookAdapter(BasePlatformAdapter):
     def _dynamic_route_allowed(self, name: str, route: dict) -> bool:
         """Reject dynamic routes whose effective secret is missing, blank, or not a string
         (_is_usable_secret); INSECURE_NO_AUTH is loopback-only."""
-        effective_secret = route.get("secret", self._global_secret)
+        effective_secret = _resolve_config_secret(route.get("secret", self._global_secret))
         if not _is_usable_secret(effective_secret):
             logger.warning("[webhook] Dynamic route '%s' skipped: 'secret' is missing, blank, or not a string. "
                            "Set a valid HMAC secret, or use '%s' to explicitly disable auth (testing only).",
@@ -554,7 +569,7 @@ class WebhookAdapter(BasePlatformAdapter):
             return None, _json_error("Payload too large", 413)
         # Missing, blank, or non-string secrets fail closed here too (not only in connect()), so direct
         # handler reuse cannot become an unauthenticated dispatch surface.
-        secret = route_config.get("secret", self._global_secret)
+        secret = _resolve_config_secret(route_config.get("secret", self._global_secret))
         if not _is_usable_secret(secret):
             logger.error("[webhook] Route %s HMAC secret is missing, blank, or not a string; refusing request",
                          route_name)
