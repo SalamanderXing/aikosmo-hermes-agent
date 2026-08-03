@@ -1518,6 +1518,9 @@ class APIServerAdapter(BasePlatformAdapter):
             raw_port = os.getenv("API_SERVER_PORT", str(DEFAULT_PORT))
         self._port: int = _coerce_port(raw_port, DEFAULT_PORT)
         self._api_key: str = extra.get("key", _get_scoped_secret("API_SERVER_KEY", ""))
+        self._delivery_status_only: bool = _coerce_request_bool(
+            extra.get("delivery_status_only"), default=False
+        )
         self._cors_origins: tuple[str, ...] = self._parse_cors_origins(
             extra.get("cors_origins", os.getenv("API_SERVER_CORS_ORIGINS", "")),
         )
@@ -2213,17 +2216,23 @@ class APIServerAdapter(BasePlatformAdapter):
         Kept as a method so multiplex tests can assert the /p/<profile>/
         mirrors without starting a real aiohttp listener.
         """
-        routes: List[tuple] = [
+        status_routes: List[tuple] = [
             ("GET", "/health", self._handle_health),
             ("GET", "/health/detailed", self._handle_health_detailed),
             ("GET", "/v1/health", self._handle_health),
-            ("GET", "/v1/models", self._handle_models),
-            ("GET", "/api/model/options", self._handle_model_options),
             (
                 "GET",
                 "/api/webhook-deliveries/{delivery_id}",
                 self._handle_webhook_delivery,
             ),
+        ]
+        if self._delivery_status_only:
+            return status_routes
+
+        routes: List[tuple] = [
+            *status_routes,
+            ("GET", "/v1/models", self._handle_models),
+            ("GET", "/api/model/options", self._handle_model_options),
             ("GET", "/v1/capabilities", self._handle_capabilities),
             # Authenticated browser-control surface: POST registration
             # mints a short-lived ticket; the controller then opens the WS with
