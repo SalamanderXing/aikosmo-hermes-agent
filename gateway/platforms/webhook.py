@@ -37,6 +37,7 @@ import hashlib
 import hmac
 import json
 import logging
+import os
 import re
 import subprocess
 import sys
@@ -170,6 +171,17 @@ def _hmac_str_equal(provided: str, expected: str) -> bool:
     return hmac.compare_digest(provided.encode(), expected.encode())
 
 
+def _resolve_config_secret(value: object) -> str:
+    """Resolve an exact ``${ENV_VAR}`` secret reference without interpolation."""
+    if not isinstance(value, str):
+        return ""
+    if value.startswith("${") and value.endswith("}"):
+        name = value[2:-1]
+        if name and name.replace("_", "").isalnum():
+            return os.environ.get(name, "")
+    return value
+
+
 def check_webhook_requirements() -> bool:
     """Check if webhook adapter dependencies are available."""
     return AIOHTTP_AVAILABLE
@@ -192,7 +204,7 @@ class WebhookAdapter(BasePlatformAdapter):
         _cfg_host = config.extra.get("host", DEFAULT_HOST)
         self._host: Optional[str] = _cfg_host or None
         self._port: int = int(config.extra.get("port", DEFAULT_PORT))
-        self._global_secret: str = config.extra.get("secret", "")
+        self._global_secret = _resolve_config_secret(config.extra.get("secret", ""))
         self._static_routes: Dict[str, dict] = config.extra.get("routes", {})
         self._dynamic_routes: Dict[str, dict] = {}
         self._dynamic_routes_mtime: float = 0.0
@@ -252,7 +264,7 @@ class WebhookAdapter(BasePlatformAdapter):
 
         # Validate routes at startup — secret is required per route
         for name, route in self._routes.items():
-            secret = route.get("secret", self._global_secret)
+            secret = _resolve_config_secret(route.get("secret", self._global_secret))
             if not secret:
                 raise ValueError(
                     f"[webhook] Route '{name}' has no HMAC secret. "
@@ -530,7 +542,9 @@ class WebhookAdapter(BasePlatformAdapter):
             for k, v in data.items():
                 if k in self._static_routes:
                     continue
-                effective_secret = v.get("secret", self._global_secret)
+                effective_secret = _resolve_config_secret(
+                    v.get("secret", self._global_secret)
+                )
                 if not effective_secret:
                     logger.warning(
                         "[webhook] Dynamic route '%s' skipped: 'secret' is "
@@ -707,7 +721,9 @@ class WebhookAdapter(BasePlatformAdapter):
         # INSECURE_NO_AUTH mode). Missing/empty secrets must fail closed here,
         # not only during connect(), so direct handler reuse cannot turn a
         # network webhook route into an unauthenticated agent-dispatch surface.
-        secret = route_config.get("secret", self._global_secret)
+        secret = _resolve_config_secret(
+            route_config.get("secret", self._global_secret)
+        )
         if not secret:
             logger.error(
                 "[webhook] Route %s has no HMAC secret; refusing request",
