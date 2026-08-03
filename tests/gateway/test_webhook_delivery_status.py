@@ -47,3 +47,18 @@ def test_api_server_registers_authenticated_delivery_status_route() -> None:
     )
     routes = {(method, path) for method, path, _ in adapter._http_route_table()}
     assert ("GET", "/api/webhook-deliveries/{delivery_id}") in routes
+
+
+def test_delivery_status_only_excludes_agent_control_routes() -> None:
+    adapter = APIServerAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={"key": "a" * 32, "delivery_status_only": True},
+        )
+    )
+    routes = {(method, path) for method, path, _ in adapter._http_route_table()}
+
+    assert ("GET", "/api/webhook-deliveries/{delivery_id}") in routes
+    assert ("POST", "/api/sessions") not in routes
+    assert ("POST", "/v1/runs") not in routes
+    assert ("POST", "/api/jobs") not in routes

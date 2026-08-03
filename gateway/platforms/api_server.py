@@ -1195,6 +1195,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         extra = config.extra or {}
         self._host, self._port = listen_address(extra)
         self._api_key: str = extra.get("key", _get_scoped_secret("API_SERVER_KEY", ""))
+        self._delivery_status_only: bool = _coerce_request_bool(extra.get("delivery_status_only"), default=False)
         self._cors_origins: tuple[str, ...] = self._parse_cors_origins(
             extra.get("cors_origins", os.getenv("API_SERVER_CORS_ORIGINS", "")))
         self._model_name: str = self._resolve_model_name(
@@ -1719,11 +1720,15 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     def _http_route_table(self) -> list[tuple]:
         """(method, path, handler) rows registered by ``connect()`` (a method so multiplex tests
         can assert the /p/<profile>/ mirrors without a listener)."""
-        routes: list[tuple] = [
+        status_routes: list[tuple] = [
             ("GET", "/health", self._handle_health),
             ("GET", "/health/detailed", self._handle_health_detailed),
             ("GET", "/v1/health", self._handle_health),
-            ("GET", "/api/webhook-deliveries/{delivery_id}", self._handle_webhook_delivery),
+            ("GET", "/api/webhook-deliveries/{delivery_id}", self._handle_webhook_delivery)]
+        if self._delivery_status_only:
+            return status_routes
+        routes: list[tuple] = [
+            *status_routes,
             ("GET", "/v1/models", self._handle_models),
             ("GET", "/api/model/options", self._handle_model_options),
             ("GET", "/v1/capabilities", self._handle_capabilities),
