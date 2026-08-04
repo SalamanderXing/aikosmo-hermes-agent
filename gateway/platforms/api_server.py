@@ -2225,6 +2225,16 @@ class APIServerAdapter(BasePlatformAdapter):
                 "/api/webhook-deliveries/{delivery_id}",
                 self._handle_webhook_delivery,
             ),
+            (
+                "GET",
+                "/api/webhook-deliveries/{delivery_id}/session",
+                self._handle_webhook_delivery_session,
+            ),
+            (
+                "POST",
+                "/api/webhook-deliveries/{delivery_id}/feedback",
+                self._handle_webhook_delivery_feedback,
+            ),
         ]
         if self._delivery_status_only:
             return status_routes
@@ -2305,6 +2315,54 @@ class APIServerAdapter(BasePlatformAdapter):
                 "end_reason": delivery["end_reason"],
             }
         )
+
+    def _auto_demo_delivery(self, delivery_id: str):
+        delivery = get_webhook_delivery_store().get(delivery_id)
+        if delivery is None or delivery.get("route") != "auto-demo":
+            return None
+        return delivery
+
+    async def _handle_webhook_delivery_session(self, request: "web.Request") -> "web.Response":
+        """Return the persisted transcript for one auto-demo delivery."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        delivery = self._auto_demo_delivery(request.match_info["delivery_id"])
+        if delivery is None:
+            return web.json_response({"error": "Delivery not found"}, status=404)
+        session_id = delivery.get("session_id")
+        if not session_id:
+            return web.json_response({"error": "Delivery session not available"}, status=409)
+        session, err = await self._get_existing_session_or_404(session_id)
+        if err:
+            return err
+        db = await self._ensure_session_db_async()
+        messages = await asyncio.to_thread(db.get_messages, session_id)
+        return web.json_response({
+            "delivery_id": delivery["delivery_id"],
+            "session": self._session_response(session),
+            "messages": [self._message_response(message) for message in messages],
+        })
+
+    @_admit_api_agent_request
+    async def _handle_webhook_delivery_feedback(self, request: "web.Request") -> "web.Response":
+        """Run one operator-feedback turn in the delivery's original session."""
+        delivery = self._auto_demo_delivery(request.match_info["delivery_id"])
+        if delivery is None:
+            return web.json_response({"error": "Delivery not found"}, status=404)
+        session_id = delivery.get("session_id")
+        if not session_id:
+            return web.json_response({"error": "Delivery session not available"}, status=409)
+        session, err = await self._get_existing_session_or_404(session_id)
+        if err:
+            return err
+        db = await self._ensure_session_db_async()
+        await asyncio.to_thread(db.reopen_session, session_id)
+        request.match_info["session_id"] = session_id
+        try:
+            return await self._handle_session_chat.__wrapped__(self, request)
+        finally:
+            await asyncio.to_thread(db.end_session, session_id, "webhook_feedback_complete")
 
     # ------------------------------------------------------------------
     # Session header helpers
