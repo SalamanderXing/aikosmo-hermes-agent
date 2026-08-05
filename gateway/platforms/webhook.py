@@ -763,7 +763,58 @@ class WebhookAdapter(BasePlatformAdapter):
         task.add_done_callback(self._background_tasks.discard)
         return task
 
+    def _route_for_source(self, source) -> Optional[dict]:
+        """Route config of the route that minted this event's source.
+
+        Keyed on ``user_id`` (exactly ``webhook:{route}``, as ``toolsets_for_source`` does), not on the chat
+        id: per-delivery chat ids are opaque ``webhook:v2:<token>`` values."""
+        user_id = str(getattr(source, "user_id", "") or "")
+        if not user_id.startswith("webhook:"):
+            return None
+        route = self._routes.get(user_id[len("webhook:"):])
+        return route if isinstance(route, dict) else None
+
+    def _approval_session_key_for(self, event: MessageEvent) -> Optional[str]:
+        """Compute the gateway session key the approval layer is bound to.
+
+        The turn runner binds ``ctx.session_key`` — the session store's key for the source — with
+        ``set_current_session_key`` before ``agent.run`` (gateway/run_turn_runner.py), so
+        ``_session_key_for_source`` is the correct namespace for ``enable_session_yolo``."""
+        runner = self.gateway_runner
+        key_fn = getattr(runner, "_session_key_for_source", None) if runner else None
+        if not callable(key_fn):
+            return None
+        try:
+            return key_fn(event.source)
+        except Exception:
+            return None
+
+    def _sync_route_yolo(self, event: MessageEvent, *, enable: bool) -> None:
+        """Enable/disable approval-free execution for a ``yolo: true`` route.
+
+        Webhook routes are unattended lanes: a pending approval has no human behind it, times out, and
+        auto-denies — killing the run. Routes that opt in via ``yolo: true`` run with session-scoped yolo
+        instead. Session yolo is NOT a full bypass: the hardline unconditional blocklist in tools.approval
+        still rejects catastrophic commands."""
+        route = self._route_for_source(event.source)
+        if not route or not route.get("yolo"):
+            return
+        session_key = self._approval_session_key_for(event)
+        if not session_key:
+            logger.warning("[webhook] yolo route requested but no session key resolvable for chat %s; approvals "
+                           "stay in the default mode", getattr(event.source, "chat_id", ""))
+            return
+        from tools.approval import disable_session_yolo, enable_session_yolo
+        if enable:
+            enable_session_yolo(session_key)
+            logger.info("[webhook] session yolo enabled for %s (route yolo: true)", session_key)
+        else:
+            disable_session_yolo(session_key)
+
     async def on_processing_start(self, event: MessageEvent) -> None:
+        # Before the delivery-store guard: yolo routes need the approval bypass regardless of durable_status
+        # bookkeeping.
+        self._sync_route_yolo(event, enable=True)
         delivery_id = event.message_id
         if not delivery_id:
             return
@@ -794,6 +845,7 @@ class WebhookAdapter(BasePlatformAdapter):
         """Close the one-shot per-delivery session: ``prune_sessions`` only reaps rows with ``ended_at`` set, so
         unclosed webhook sessions leak unbounded. Fires at the true end of the run; ``end_session()`` is
         first-reason-wins."""
+        self._sync_route_yolo(event, enable=False)
         session_id = self._resolve_webhook_session_id(event)
         if get_webhook_delivery_store().get(event.message_id) is not None:
             get_webhook_delivery_store().mark_ended(
