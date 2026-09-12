@@ -40,6 +40,8 @@ Requires:
 """
 
 import asyncio
+import base64
+import binascii
 import errno
 import hashlib
 import hmac
@@ -128,6 +130,11 @@ MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversation
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
+MAX_SESSION_ATTACHMENT_BYTES = 5 * 1024 * 1024
+MAX_SESSION_ATTACHMENT_COUNT = 5
+SESSION_ATTACHMENT_EXTENSIONS = {
+    ".csv", ".docx", ".json", ".md", ".pdf", ".pptx", ".txt", ".xlsx",
+}
 RESPONSES_AUTO_TRUNCATION_HISTORY_LIMIT = 100
 _COMPRESSED_SUMMARY_METADATA_KEY = "_compressed_summary"
 
@@ -618,9 +625,75 @@ def _multimodal_validation_error(exc: ValueError, *, param: str) -> "web.Respons
     )
 
 
-def _session_chat_user_message(body: Dict[str, Any], *, param: str = "message") -> tuple[Any, Optional["web.Response"]]:
+def _stage_session_file_parts(content: Any, session_id: str) -> Any:
+    """Turn authenticated API file parts into bounded workspace @file refs."""
+    if not isinstance(content, list):
+        return content
+    file_parts = [
+        part for part in content
+        if isinstance(part, dict)
+        and str(part.get("type") or "").strip().lower() in _FILE_PART_TYPES
+    ]
+    if not file_parts:
+        return content
+    if len(file_parts) > MAX_SESSION_ATTACHMENT_COUNT:
+        raise ValueError(
+            f"invalid_content_part:At most {MAX_SESSION_ATTACHMENT_COUNT} files may be attached."
+        )
+
+    safe_session_id = re.sub(r"[^a-zA-Z0-9._-]", "-", session_id)[:128] or "session"
+    attachment_dir = Path.cwd() / ".hermes" / "api-attachments" / safe_session_id
+    decoded_files: List[tuple[str, str, bytes]] = []
+    total_bytes = 0
+    for part in file_parts:
+        filename = Path(str(part.get("filename") or "attachment")).name
+        safe_name = re.sub(r"[^a-zA-Z0-9._-]", "-", filename).strip(".-")
+        extension = Path(safe_name).suffix.lower()
+        if not safe_name or extension not in SESSION_ATTACHMENT_EXTENSIONS:
+            raise ValueError("unsupported_content_type:This document type is not supported.")
+        data_url = part.get("file_data")
+        if not isinstance(data_url, str) or "," not in data_url:
+            raise ValueError("invalid_content_part:File parts must include base64 file_data.")
+        header, encoded = data_url.split(",", 1)
+        if not header.startswith("data:") or ";base64" not in header.lower():
+            raise ValueError("invalid_content_part:File parts must use a base64 data URL.")
+        try:
+            file_bytes = base64.b64decode(encoded, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError("invalid_content_part:File data is not valid base64.") from exc
+        total_bytes += len(file_bytes)
+        if total_bytes > MAX_SESSION_ATTACHMENT_BYTES:
+            raise ValueError("invalid_content_part:Attached files exceed the 5 MB total limit.")
+
+        decoded_files.append((filename, safe_name, file_bytes))
+
+    attachment_dir.mkdir(parents=True, exist_ok=True)
+    staged = iter(decoded_files)
+    normalized: List[Any] = []
+    for part in content:
+        if not isinstance(part, dict) or str(part.get("type") or "").strip().lower() not in _FILE_PART_TYPES:
+            normalized.append(part)
+            continue
+        filename, safe_name, file_bytes = next(staged)
+        path = attachment_dir / f"{uuid.uuid4().hex[:10]}-{safe_name}"
+        path.write_bytes(file_bytes)
+        relative_path = path.relative_to(Path.cwd())
+        normalized.append({
+            "type": "input_text",
+            "text": f"[Attached file: {safe_name}]\n@file:{relative_path}",
+        })
+    return normalized
+
+
+def _session_chat_user_message(
+    body: Dict[str, Any], *, session_id: str = "session", param: str = "message"
+) -> tuple[Any, Optional["web.Response"]]:
     """Parse and normalize session chat ``message`` / ``input`` like chat completions."""
     user_message = body.get("message") or body.get("input")
+    try:
+        user_message = _stage_session_file_parts(user_message, session_id)
+    except ValueError as exc:
+        return None, _multimodal_validation_error(exc, param=param)
     if not _content_has_visible_payload(user_message):
         return None, web.json_response(
             _openai_error("Missing 'message' field", code="missing_message"),
@@ -3431,7 +3504,7 @@ class APIServerAdapter(BasePlatformAdapter):
         body, err = await self._read_json_body(request)
         if err:
             return err
-        user_message, err = _session_chat_user_message(body)
+        user_message, err = _session_chat_user_message(body, session_id=session_id)
         if err is not None:
             return err
         system_prompt = body.get("system_message") or body.get("instructions")
@@ -3548,7 +3621,7 @@ class APIServerAdapter(BasePlatformAdapter):
         body, err = await self._read_json_body(request)
         if err:
             return err
-        user_message, err = _session_chat_user_message(body)
+        user_message, err = _session_chat_user_message(body, session_id=session_id)
         if err is not None:
             return err
         system_prompt = body.get("system_message") or body.get("instructions")
