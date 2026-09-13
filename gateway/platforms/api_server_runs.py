@@ -603,8 +603,13 @@ async def _handle_runs(
         )
 
     run_id = f"run_{uuid.uuid4().hex}"
-    self._run_owners[run_id] = self._run_idempotency_scope(request)
     session_id = session_id or run_id
+    user_message, content_error = _api_server._session_chat_user_message(
+        {"message": user_message}, session_id=str(session_id), param="input"
+    )
+    if content_error is not None:
+        return content_error
+    self._run_owners[run_id] = self._run_idempotency_scope(request)
     # Approval queues gate host-side tool execution and must be isolated
     # per API run. Client-provided session IDs and memory session keys are
     # conversation/memory scopes, not authorization namespaces: multiple
