@@ -196,6 +196,51 @@ class TestStartRun:
                 assert status["object"] == "hermes.run"
 
     @pytest.mark.asyncio
+    async def test_run_stages_documents_and_normalizes_images(self, adapter, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        app = _create_runs_app(adapter)
+        agent = MagicMock()
+        agent.run_conversation.return_value = {"final_response": "done"}
+        agent.session_prompt_tokens = 0
+        agent.session_completion_tokens = 0
+        agent.session_total_tokens = 0
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent", return_value=agent):
+                response = await cli.post("/v1/runs", json={
+                    "session_id": "upload-smoke",
+                    "input": [{"role": "user", "content": [
+                        {"type": "input_text", "text": "Read this"},
+                        {"type": "input_file", "filename": "note.txt", "file_data": "data:text/plain;base64,aGVsbG8="},
+                        {"type": "input_image", "image_url": "data:image/png;base64,YQ=="},
+                    ]}],
+                })
+                assert response.status == 202
+                for _ in range(100):
+                    if agent.run_conversation.called:
+                        break
+                    await asyncio.sleep(0.01)
+                agent.run_conversation.assert_called_once()
+                message = agent.run_conversation.call_args.kwargs["user_message"]
+                assert any(part.get("type") == "image_url" for part in message)
+                assert "@file:" in str(message)
+                files = list((tmp_path / ".hermes/api-attachments/upload-smoke").glob("*"))
+                assert len(files) == 1
+                assert files[0].read_text() == "hello"
+
+    @pytest.mark.asyncio
+    async def test_run_rejects_invalid_document_before_starting(self, adapter, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as create:
+                response = await cli.post("/v1/runs", json={"input": [{"role": "user", "content": [
+                    {"type": "input_file", "filename": "note.txt", "file_data": "data:text/plain;base64,???"},
+                ]}]})
+                assert response.status == 400
+                create.assert_not_called()
+                assert not (tmp_path / ".hermes/api-attachments").exists()
+
+    @pytest.mark.asyncio
     async def test_start_binds_chat_id_for_delegation_wake_target(self, adapter):
         """/v1/runs must bind the raw session id as the api_server chat_id
         (like every other agent-entry route does via _run_agent): the async
