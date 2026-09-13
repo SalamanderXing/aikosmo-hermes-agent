@@ -701,6 +701,11 @@ async def _handle_runs(self, request: web.Request, *, _api_server) -> web.Respon
     if selected_session_id:
         selected_session_id = await _resolve_live_session_id(self, str(selected_session_id))
     session_id = selected_session_id or run_id
+    user_message, content_error = _api_server._session_chat_user_message(
+        {"message": user_message}, session_id=str(session_id), param="input")
+    if content_error is not None:
+        self._run_owners.pop(run_id, None)
+        return content_error
     # History loads for the session the request actually selected — including one resolved from
     # a declared X-Hermes-Session-Key, whose persisted delivery rows must reach the next
     # same-key run's context (#98619).  previous_response_id continuations keep their
