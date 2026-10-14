@@ -1286,3 +1286,31 @@ class TestBlankRouteSecretFailsClosed:
 )
 def test_is_usable_secret_classifies_configured_secrets(value, usable):
     assert _is_usable_secret(value) is usable
+
+
+class TestWebhookTurnsKeepIntentionalSilence:
+    """AI Kosmo: webhook turns are autonomous, so the gateway's human-turn
+    "unexpected silence" notice must not replace a bare silence marker."""
+
+    @pytest.mark.asyncio
+    async def test_webhook_event_is_not_reply_expected(self):
+        from gateway.response_filters import display_kind_for_event, silence_allowed
+
+        routes = {"ci": {"secret": _INSECURE_NO_AUTH, "prompt": "build"}}
+        adapter = _make_adapter(routes=routes)
+        captured = []
+
+        async def _capture(event):
+            captured.append(event)
+
+        adapter.handle_message = _capture
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post("/webhooks/ci", json={"ref": "main"}, headers={"X-GitHub-Delivery": "silent-1"})
+            assert resp.status == 202
+        await asyncio.sleep(0.05)
+
+        assert len(captured) == 1
+        event = captured[0]
+        assert event.reply_expected is False
+        assert silence_allowed(display_kind_for_event(event), event.reply_expected)

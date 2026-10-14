@@ -754,8 +754,11 @@ class WebhookAdapter(BasePlatformAdapter):
                                    user_id=f"webhook:{route_name}", user_name=route_name)
         if profile and isinstance(profile, str):
             source.profile = profile
+        # reply_expected=False: an autonomous lane has no human waiting on this turn, so a bare silence marker
+        # stays silent instead of being replaced by the gateway's "unexpected silence" notice (run_turn's
+        # silence_allowed). A lane that owes a reply anyway must say so itself.
         event = MessageEvent(text=prompt, message_type=MessageType.TEXT, source=source, raw_message=payload,
-                             message_id=delivery_id)
+                             message_id=delivery_id, reply_expected=False)
         # The per-delivery session is closed by ``on_processing_complete`` once the run finishes
         # (``handle_message`` is fire-and-forget, so nothing can be closed here).
         task = asyncio.create_task(self.handle_message(event))
