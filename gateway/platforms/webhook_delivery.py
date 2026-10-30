@@ -88,12 +88,25 @@ def retained_destination(adapter, chat_id):
     scoped = active_authority(runner)
     candidates = [scoped] if scoped is not None else serving_authorities(runner)
     # Only the signed ingress admission carries the destination; later automation rows
-    # (process/watch completions) on the same chat share its source but never compete.
-    payloads = [payload for authority in candidates
-                for payload in authority_store(authority).admissions.webhook_ingress_payloads(chat_id=chat_id)]
+    # (process/watch completions) on the same chat share its source but never compete, and
+    # neither do later turns admitted on the chat (AI Kosmo operator feedback): the delivery's own
+    # admission is the one whose request id is the delivery id its chat id names.
+    from gateway.platforms.webhook import _WebhookDeliveryIdentity
+    delivery_id = _WebhookDeliveryIdentity.delivery_from_chat_id(chat_id)
+    payloads = [record.payload for authority in candidates
+                for record in authority_store(authority).admissions.match(request_id=delivery_id)
+                if is_ingress_payload(record.payload, chat_id)] if delivery_id else []
     if len(payloads) != 1:
         raise AuthorityRefusal('not_found')
     return checked_destination(adapter, chat_id, payloads[0])
+
+
+def is_ingress_payload(payload, chat_id):
+    """The signed webhook ingress admission of ``chat_id`` (``webhook_ingress_payloads``' row filter)."""
+    envelope = payload.get('native_text_v1') if isinstance(payload, dict) else None
+    source = envelope.get('source') if isinstance(envelope, dict) else None
+    return (isinstance(source, dict) and source.get('chat_id') == chat_id and source.get('platform') == 'webhook'
+            and envelope.get('automation') is None)
 
 
 def checked_destination(adapter, chat_id, payload):

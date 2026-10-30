@@ -59,6 +59,27 @@ def test_text_snapshot_scrubs_thinking_and_caps_its_buffer():
     assert (big.text, big.status) == ("", "unavailable"), "overflow stops streaming; the run itself goes on"
 
 
+def test_orphaned_credentials_are_swept_and_pending_ones_kept(monkeypatch):
+    """A Cloud request cancelled while its admission commits never reaches _execute_run or a refusal; its
+    credential must not outlive the run sweep."""
+    from types import SimpleNamespace
+    from gateway import kosmi_cloud
+    from gateway.platforms import api_server_authority_runs, api_server_runs
+    credential = kosmi_cloud.CloudCredential("t", None, None)
+    monkeypatch.setattr(kosmi_cloud, "_credentials", {})
+    for run_id in ("young", "live-task", "queued", "settled", "never-committed"):
+        kosmi_cloud.register(run_id, credential)
+    old = time.monotonic() - kosmi_cloud.ORPHAN_GRACE_SECONDS - 1
+    for run_id in ("live-task", "queued", "settled", "never-committed"):
+        kosmi_cloud._credentials[run_id] = (old, credential)
+    rows = {"queued": {"status": "queued"}, "settled": {"status": "terminal"}}
+    monkeypatch.setattr(api_server_authority_runs, "run_admission",
+                        lambda _adapter, run_id: (None, rows[run_id]) if run_id in rows else None)
+    adapter = SimpleNamespace(_active_run_tasks={"live-task": object()})
+    kosmi_cloud.sweep(lambda run_id: api_server_runs._run_pending(adapter, run_id))
+    assert sorted(kosmi_cloud._credentials) == ["live-task", "queued", "young"]
+
+
 def digest(token):
     import hashlib
     return hashlib.sha256(token.encode()).hexdigest()[:16]
@@ -184,9 +205,14 @@ async def probe(peer):
             "instructions": "You are Kosmi. Help this customer use Cloud.",
             "input": [{"role": "user", "content": [
                 {"type": "input_text", "text": "READ_UPLOAD please"},
+                {"type": "input_image", "image_url": f"data:image/png;base64,{png}"},
                 {"type": "input_file", "filename": "notes.txt", "file_data": "data:text/plain;base64," + upload}]}]})
         customer = await finish(customer_id)
         assert customer["status"] == "completed" and "HTTP_UPLOAD_CONTENT" in customer["output"], customer
+        # The customer's image survives into SessionDB too (its agent's platform is cloud_customer).
+        stored = next(m for m in authority.db.get_messages("customer-one") if m["role"] == "user")["content"]
+        stored = json.loads(stored) if isinstance(stored, str) and stored.startswith("[") else stored
+        assert "data:image/png" in json.dumps(stored), stored
         customer_requests = [r for r in peer.requests if "READ_UPLOAD" in json.dumps(r["messages"])]
         customer_tools = sorted({t["function"]["name"] for r in customer_requests for t in r.get("tools", [])})
         prompts = json.dumps([m for r in customer_requests for m in r["messages"] if m["role"] == "system"])

@@ -99,20 +99,6 @@ def is_thread_chat(chat_id: str) -> bool:
     return len(parts) == 3 and parts[0] == "webhook" and parts[1] != "v2" and parts[2].startswith(THREAD_CHAT_PREFIX)
 
 
-def delivery_uuid(chat_id: str) -> str:
-    """The provider delivery id a one-shot ``webhook:v2:`` chat id names, else ''."""
-    import base64
-    import binascii
-    if not (chat_id or "").startswith("webhook:v2:"):
-        return ""
-    token = chat_id[len("webhook:v2:"):]
-    try:
-        decoded = json.loads(base64.urlsafe_b64decode(token + "=" * (-len(token) % 4)))
-    except (binascii.Error, ValueError):
-        return ""
-    return decoded[2] if isinstance(decoded, list) and len(decoded) == 3 and isinstance(decoded[2], str) else ""
-
-
 def _signed_rows(adapter, chat_id: str) -> list:
     from gateway.session_authorities import active_authority, serving_authorities
     runner = adapter.gateway_runner or getattr(adapter._message_handler, "__self__", None)
@@ -126,7 +112,8 @@ def turn_destination(adapter, chat_id: str, turn=None) -> dict:
     its ``reply_id``, the id the comment is created under. ``turn`` is the replying turn's event (default: ``replying_turn``)."""
     from gateway.platforms.webhook_delivery import checked_destination, retained_destination
     if not is_thread_chat(chat_id):
-        return _with_reply_id(retained_destination(adapter, chat_id), delivery_uuid(chat_id))
+        from gateway.platforms.webhook import _WebhookDeliveryIdentity
+        return _with_reply_id(retained_destination(adapter, chat_id), _WebhookDeliveryIdentity.delivery_from_chat_id(chat_id))
     turn = turn if turn is not None else replying_turn.get()
     from gateway.session_authorities import all_authorities
     if not all_authorities(adapter.gateway_runner or getattr(adapter._message_handler, "__self__", None)):

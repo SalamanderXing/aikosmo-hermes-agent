@@ -14,9 +14,10 @@ boot (``gateway.session_unattended_unknown``) instead of pausing its conversatio
 from __future__ import annotations
 
 import threading
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Iterator, Optional
+from typing import Callable, Iterator, Optional
 
 CLOUD_RUNTIMES = ("staff", "customer")
 CUSTOMER_PLATFORM = "cloud_customer"
@@ -24,6 +25,9 @@ CUSTOMER_TOOLSET = "kosmo-cloud-customer"
 CUSTOMER_TOOLS = frozenset({"cloud_read", "cloud_read_attachment", "kosmo_cli"})
 # kosmo-cli work is multi-step (help, read, change, verify).
 CUSTOMER_MAX_ITERATIONS = 40
+# A credential whose run has no live task and no pending admission this long after registration belongs to
+# work that never committed (a request cancelled mid-admission); the run sweep drops it.
+ORPHAN_GRACE_SECONDS = 60
 CREDENTIAL_LOST = ("This Cloud message was saved but Hermes restarted before it ran, and the sign-in it "
                    "carried is not kept across restarts. Send it again.")
 
@@ -35,18 +39,29 @@ class CloudCredential:
     attachment_root: Optional[str] = None  # customer runs: the one upload directory the reader may open
 
 
-_credentials: dict[str, CloudCredential] = {}
+_credentials: dict[str, tuple[float, CloudCredential]] = {}
 _lock = threading.Lock()
 
 
 def register(request_id: str, credential: CloudCredential) -> None:
     with _lock:
-        _credentials[request_id] = credential
+        _credentials[request_id] = (time.monotonic(), credential)
 
 
 def discard(request_id: str) -> None:
     with _lock:
         _credentials.pop(request_id, None)
+
+
+def sweep(pending: Callable[[str], bool], now: Optional[float] = None) -> None:
+    """Drop credentials past the grace period whose run is not ``pending`` (no live task, no queued or
+    started admission): nothing can bind them any more."""
+    now = time.monotonic() if now is None else now
+    with _lock:
+        stale = [rid for rid, (at, _) in _credentials.items() if now - at > ORPHAN_GRACE_SECONDS]
+    for request_id in stale:
+        if not pending(request_id):
+            discard(request_id)
 
 
 def cloud_runtime(prepared) -> Optional[str]:
@@ -76,12 +91,13 @@ def cloud_turn(row, prepared) -> Iterator[Optional[str]]:
         yield None
         return
     with _lock:
-        credential = _credentials.get(row["request_id"]) if row.get("principal_id") == "api" else None
-    if credential is None:
+        entry = _credentials.get(row["request_id"]) if row.get("principal_id") == "api" else None
+    if entry is None:
         yield CREDENTIAL_LOST
         return
     from gateway.session_context import (
         kosmo_attachment_root, kosmo_cli_access_token, kosmo_cli_restricted_hotel_slugs)
+    credential = entry[1]
     tokens = [(var, var.set(value)) for var, value in (
         (kosmo_cli_access_token, credential.token),
         (kosmo_cli_restricted_hotel_slugs, credential.hotel_slugs),
