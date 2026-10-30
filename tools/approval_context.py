@@ -5,6 +5,7 @@ unattended predicates, and the ``approvals.*`` config readers used by every
 gate in :mod:`tools.approval`.
 """
 
+import contextlib
 import contextvars
 import logging
 import os
@@ -304,13 +305,30 @@ def _get_approval_config() -> dict:
         return {}
 
 
+# AI Kosmo: a turn on an unattended lane (a webhook ``yolo: true`` route) runs with approvals off, bound for
+# exactly that turn (``unattended_turn``); nobody is there to answer a prompt, which would time out and deny.
+_unattended_turn: contextvars.ContextVar[bool] = contextvars.ContextVar("approval_unattended_turn", default=False)
+
+
+@contextlib.contextmanager
+def unattended_turn(enabled: bool):
+    token = _unattended_turn.set(bool(enabled))
+    try:
+        yield
+    finally:
+        _unattended_turn.reset(token)
+
+
 def _get_approval_mode() -> str:
     """Return 'manual', 'smart', or 'off' (a hosted-room policy overrides config).
 
     A subagent routed to another profile runs as that profile, but the room policy was signed for the
     room MEMBER's profile: under the profile route's own mark the stricter of the two modes governs.
     The routed profile's own mode is never loosened by the member's, and a turn another installation
-    dispatched never runs at ``off`` (the catalog refuses an ``off`` room policy for that reason)."""
+    dispatched never runs at ``off`` (the catalog refuses an ``off`` room policy for that reason).
+    An unattended turn (AI Kosmo, ``unattended_turn``) runs at ``off``."""
+    if _unattended_turn.get():
+        return "off"
     mode = None
     try:
         from gateway.hosted_room_execution_policy import current_room_execution_policy, profile_routed

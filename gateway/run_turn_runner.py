@@ -1330,6 +1330,11 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                     raise
             else:
                 scope.enter_context(api_policy_scope())
+                # AI Kosmo: a lane its adapter runs unattended (webhook ``yolo: true`` routes) is approval-free
+                # for this turn only; the hardline blocklist still applies.
+                from tools.approval_context import unattended_turn
+                unattended = getattr(self._runner._adapter_for_source(self._ctx.source), "unattended_yolo", None)
+                scope.enter_context(unattended_turn(callable(unattended) and unattended(self._ctx.source) is True))
                 bind_turn_workspace(policy, self._ctx.session_id)
                 from gateway.session_terminal_cwd import persist_turn_cwd, restore_turn_cwd
                 cwd_owner = restore_turn_cwd(self._runner, self._ctx.session_key, policy)

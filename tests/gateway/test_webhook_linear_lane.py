@@ -309,39 +309,9 @@ def main():
     import threading
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     sys.path.insert(1, str(Path(__file__).parent / "fixtures"))
-    from shared_authority_peer import ModelPeer
+    from kosmi_peer import ScriptedPeer
 
-    class TagPeer(ModelPeer):
-        """Answers ``ANSWER <TAG-x>`` for the newest user message's tag, ``NO_REPLY`` for SAY_NOTHING."""
-
-        def do_POST(self):
-            length = int(self.headers["Content-Length"])
-            raw = self.rfile.read(length)
-            request = json.loads(raw)
-            last = next((m.get("content", "") for m in reversed(request.get("messages", [])) if m.get("role") == "user"), "")
-            text = json.dumps(last)
-            if "BLOCK_FIFO" in text:
-                self.server.blocked.set()
-                assert self.server.release.wait(20), "fixture model gate timed out"
-            tag = re.findall(r"TAG-[a-z]+", text)
-            reply = "NO_REPLY" if "SAY_NOTHING" in text else f"ANSWER {tag[-1]}" if tag else "ANSWER none"
-            self.server.requests.append(request)
-            base = {"id": "c", "model": "local-wire-stub", "created": 1}
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream" if request.get("stream") else "application/json")
-            self.end_headers()
-            if request.get("stream"):
-                for delta, finish in [({"role": "assistant", "content": reply}, None), ({}, "stop")]:
-                    chunk = {**base, "object": "chat.completion.chunk",
-                             "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
-                    self.wfile.write(("data: " + json.dumps(chunk) + "\n\n").encode())
-                self.wfile.write(b"data: [DONE]\n\n")
-                return
-            self.wfile.write(json.dumps({**base, "object": "chat.completion",
-                "choices": [{"index": 0, "message": {"role": "assistant", "content": reply}, "finish_reason": "stop"}],
-                "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}}).encode())
-
-    peer = ThreadingHTTPServer(("127.0.0.1", 0), TagPeer)
+    peer = ThreadingHTTPServer(("127.0.0.1", 0), ScriptedPeer)
     peer.requests, peer.metadata_requests = [], []
     peer.blocked, peer.release = threading.Event(), threading.Event()
     threading.Thread(target=peer.serve_forever, daemon=True).start()
