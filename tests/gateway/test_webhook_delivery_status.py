@@ -177,6 +177,52 @@ async def probe(peer):
             (row,) = authority.db._read_all("SELECT target_session_id FROM session_admissions WHERE request_id LIKE ?",
                                             ("auto-demo-2-200:feedback:%",))
             assert row["target_session_id"] == second_sid, "feedback rotated into a fresh session"
+
+            # A feedback request cancelled while the authority reserves its route, with the delivery's own
+            # close pending: the admission still owns the session, so the close waits for it, and this and
+            # the next feedback stay in the delivery's session.
+            import threading
+            from gateway.platforms.webhook_status import feedback_event, find_delivery
+            from gateway.session_envelope import restore_native
+            close_gate = asyncio.Event()
+
+            async def held_end(event, chat_id):
+                await close_gate.wait()
+                await real_end(event, chat_id)
+            adapter._end_webhook_session = held_end
+            await post(client, "auto-demo", "third run", "auto-demo-3-300")
+            await async_wait_until(lambda: (delivery_status(runner, "auto-demo-3-300") or {}).get("status") == "ended",
+                                   timeout=30, what="the third delivery to settle")
+            _authority, delivered, _route = find_delivery(runner, "auto-demo-3-300")
+            third_sid = delivered["target_session_id"]
+            source = restore_native(delivered["payload"], runner).source
+            destination = dict(delivered["payload"]["native_text_v1"]["webhook_delivery"])
+            entered, proceed = threading.Event(), threading.Event()
+            real_reserve = authority._reserve_route
+
+            def held_reserve(src):
+                entered.set()
+                assert proceed.wait(20)
+                return real_reserve(src)
+            authority._reserve_route = held_reserve
+            cancelled = asyncio.create_task(adapter.admit_followup(
+                feedback_event(source, third_sid, "auto-demo-3-300", "cancelled feedback"), destination,
+                lambda: authority.db.reopen_session(third_sid)))
+            assert await asyncio.to_thread(entered.wait, 15)
+            cancelled.cancel()
+            try:
+                await cancelled
+            except asyncio.CancelledError:
+                pass
+            close_gate.set()
+            await asyncio.sleep(0.3)  # without an owned critical section, the close lands here
+            proceed.set()
+            authority._reserve_route, adapter._end_webhook_session = real_reserve, real_end
+            await async_wait_until(lambda: not adapter._background_tasks, timeout=30, what="the cancelled feedback")
+            await run_feedback(runner, "auto-demo-3-300", "after a cancelled request")
+            targets = {r["target_session_id"] for r in authority.db._read_all(
+                "SELECT target_session_id FROM session_admissions WHERE request_id LIKE ?", ("auto-demo-3-300%",))}
+            assert targets == {third_sid}, targets
             for refused, code in (("missing", 404), ("plain-1", 404)):
                 try:
                     await run_feedback(runner, refused, "x")

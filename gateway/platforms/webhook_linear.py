@@ -18,6 +18,7 @@ ambiguous failure, the intended comment is read back and accepted only on a full
 without a v4 id refuses to post rather than lose idempotency.
 """
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -129,8 +130,18 @@ def turn_destination(adapter, chat_id: str, turn=None) -> dict:
     own = next((row for row in rows if row["request_id"] == message_id), None)
     row = own or rows[-1]
     destination = checked_destination(adapter, chat_id, json.loads(row["payload_json"]))
-    # A gateway-started turn is one new answer: a reply id of its own.
-    return _with_reply_id(destination, own["request_id"] if own else str(uuid.uuid4()))
+    # A gateway-started turn is one new answer: a reply id of its own, derived from the turn's own identity
+    # so every attempt to deliver that answer (a retry, a redelivery) converges on one comment; no turn
+    # identity, no idempotency key, no post.
+    return _with_reply_id(destination, own["request_id"] if own else _derived_reply_id(message_id))
+
+
+def _derived_reply_id(turn_id: str) -> str:
+    """A UUID v4-shaped id fixed by a gateway-started turn's message id ('' without one)."""
+    if not turn_id:
+        return ""
+    digest = hashlib.sha256(f"linear-reply:{turn_id}".encode()).digest()[:16]
+    return str(uuid.UUID(bytes=digest, version=4))
 
 
 def _with_reply_id(destination: dict, reply_id: str) -> dict:

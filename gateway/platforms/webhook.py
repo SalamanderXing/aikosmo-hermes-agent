@@ -263,9 +263,7 @@ class WebhookAdapter(BasePlatformAdapter):
         self._delivery_info: dict[str, dict] = {}
         self._delivery_info_created: dict[str, float] = {}
         self._delivery_info_order: deque[tuple[float, str]] = deque()
-        # AI Kosmo: closing a delivery's session (its finalization, a provider retry's) and a follow-up's
-        # reopen + admission never interleave (admit_followup), so feedback can never land in a session
-        # that was just closed again.
+        # AI Kosmo: every webhook admission and every close of a delivery session (_commit_turn).
         self._session_close_lock = asyncio.Lock()
         self.gateway_runner = None  # set externally; needed for cross-platform delivery
         # Idempotency is scoped to the authenticated route and routed profile: provider delivery
@@ -891,27 +889,20 @@ class WebhookAdapter(BasePlatformAdapter):
         session_chat_id = thread_chat_id(route_name, thread_key) if thread_key else identity.session_chat_id
         # ``profile`` rides along so the reply leg (``send`` → ``_deliver_cross_platform``) egresses through
         # THIS profile's adapter, home channel and secrets — not the first profile that has the platform.
-        self._delivery_info[session_chat_id] = {
+        delivery = {
             "deliver": route_config.get("deliver", "log"), "profile": profile,
             "deliver_extra": self._render_delivery_extra(route_config.get("deliver_extra", {}), payload),
             "route": route_name,
             "mirror": route_config.get("mirror_to_session") is True,
             **({"toolset_tier": tier} if tier else {})}
-        self._delivery_info_created[session_chat_id] = now
-        self._delivery_info_order.append((now, session_chat_id))
-        self._prune_delivery_info(now)
         source = self._admission_source(route_name, profile, delivery_id, chat_id=session_chat_id)
         # reply_expected=False: an autonomous lane has no human waiting on this turn, so a bare silence marker
         # stays silent instead of being replaced by the gateway's "unexpected silence" notice (run_turn's
         # silence_allowed). A lane that owes a reply anyway must say so itself.
         event = MessageEvent(text=prompt, message_type=MessageType.TEXT, source=source, raw_message=payload,
                              message_id=delivery_id, timestamp=datetime.fromtimestamp(0, UTC), reply_expected=False)
-        from gateway.platforms.webhook_ingress import admit_producer
         try:
-            # A provider retry of a settled delivery closes its session inside the admission
-            # (_webhook_retry): under the close lock, like every close (see admit_followup).
-            async with self._session_close_lock:
-                receipt = await admit_producer(self, event)
+            receipt, _finalization = await self._commit_turn(event, delivery)
         except Exception:
             logger.exception("[webhook] Durable admission failed for %s", delivery_id)
             return None
@@ -923,30 +914,44 @@ class WebhookAdapter(BasePlatformAdapter):
             reply = getattr(event, '_consumer_reply', None)
             if reply:
                 from gateway.platforms.webhook_delivery import snapshot_destination
-                await self._deliver_to(snapshot_destination(self, self._delivery_info.get(session_chat_id)),
-                                       session_chat_id, reply)
-            return "accepted"
-        await self._start_finalization(event, receipt)
+                await self._deliver_to(snapshot_destination(self, delivery), session_chat_id, reply)
         return "accepted"
 
     async def admit_followup(self, event: MessageEvent, delivery: dict, reopen) -> Optional[asyncio.Task]:
         """AI Kosmo: admit a turn on an existing delivery's chat (operator feedback on an auto-demo run), as the
         delivery itself was admitted: same validated destination, same route yolo, same finalization.
         ``reopen`` (blocking) reopens the session the delivery's finalization closed: a closed row would make
-        the routing store open a fresh conversation. It and the admission run under the close lock, so the
-        delivery's own finalization cannot close the session in between; once the turn is committed,
-        finalization leaves a session with unsettled admissions open. Returns the finalization task (it
-        resolves once the turn settled and the session is closed again), or None when a plugin consumed the
-        turn and nothing was committed."""
-        self._delivery_info[event.source.chat_id] = delivery
-        self._delivery_info_created[event.source.chat_id] = now = time.time()
-        self._delivery_info_order.append((now, event.source.chat_id))
-        self._prune_delivery_info(now)
+        the routing store open a fresh conversation. Returns the finalization task (it resolves once the turn
+        settled and the session is closed again), or None when a plugin consumed the turn."""
+        return (await self._commit_turn(event, delivery, reopen))[1]
+
+    async def _commit_turn(self, event: MessageEvent, delivery: dict, reopen=None):
+        """AI Kosmo: one webhook turn's admission as a single critical section that its own task owns, so a
+        cancelled caller (a dropped HTTP request) can neither release the lock while the authority's shielded
+        reservation and write still run, nor separate the destination from its admission. Under the close
+        lock, which every close of a delivery session also takes (its finalization; a provider retry closes
+        inside the admission, ``_webhook_retry``): publish the turn's destination (the admission snapshots it
+        from ``_delivery_info``, and a thread chat's deliveries share one key), reopen a closed session,
+        admit, register the finalization. ``(receipt, finalization task or None)``."""
         from gateway.platforms.webhook_ingress import admit_producer
-        async with self._session_close_lock:
-            await asyncio.to_thread(reopen)
-            receipt = await admit_producer(self, event)
-        return None if receipt is None else await self._start_finalization(event, receipt)
+
+        async def critical():
+            chat_id = event.source.chat_id
+            async with self._session_close_lock:
+                self._delivery_info[chat_id] = delivery
+                self._delivery_info_created[chat_id] = now = time.time()
+                self._delivery_info_order.append((now, chat_id))
+                self._prune_delivery_info(now)
+                if reopen is not None:
+                    await asyncio.to_thread(reopen)
+                receipt = await admit_producer(self, event)
+                if receipt is None or getattr(event, '_webhook_duplicate', False):
+                    return receipt, None
+                return receipt, await self._start_finalization(event, receipt)
+        task = asyncio.ensure_future(critical())
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return await asyncio.shield(task)
 
     async def _start_finalization(self, event, receipt) -> asyncio.Task:
         from gateway.session_authorities import active_authority, authority_for_profile_id
