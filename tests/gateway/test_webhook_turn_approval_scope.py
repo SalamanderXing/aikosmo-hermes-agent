@@ -75,5 +75,3 @@ class ApprovalScopeTest(unittest.TestCase):
         route['yolo'] = False
         second = turn.run_sync()
         self.assertEqual(second, {'mode': 'manual', 'exec': 'decline', 'patch': 'decline'})
-
-

@@ -110,12 +110,18 @@ def _active_profile_name(agent: Any, ambient) -> str:
         return "default"
 
 
+def _is_cloud_customer(agent: Any) -> bool:
+    """AI Kosmo: the restricted Cloud customer runtime (gateway/kosmi_cloud.py), which gets no staff context."""
+    from gateway.kosmi_cloud import CUSTOMER_PLATFORM
+    return getattr(agent, "platform", None) == CUSTOMER_PLATFORM
+
+
 def _frozen_plugin_prompt_sections(agent: Any) -> tuple:
     """Render plugin sections once per session and freeze them on the agent.
     A restored ``_cached_system_prompt`` is parsed instead of re-running plugin
     code; a render that raises at a rebuild boundary keeps the previous bytes
     (stashed by ``invalidate_system_prompt``) instead of silently vanishing."""
-    if agent.platform == "cloud_customer":
+    if _is_cloud_customer(agent):
         return ()
     if hasattr(agent, "_plugin_system_prompt_sections_snapshot"):
         return agent._plugin_system_prompt_sections_snapshot
@@ -678,7 +684,7 @@ def _coding_parts(agent: Any) -> tuple[list[str], list[str], list[str]]:
     """
     try:
         from agent.coding_context import coding_system_prompt_parts
-        if not agent.valid_tool_names or agent.platform == "cloud_customer":
+        if not agent.valid_tool_names or _is_cloud_customer(agent):
             return [], [], []
         cwd = resolve_context_cwd()
         cwd_key = _workspace_pin_key()
@@ -702,7 +708,7 @@ def _post_workspace_parts(agent: Any) -> list[str]:
     (config.yaml agent.environment_probe; one line, nothing when clean, skipped
     for remote backends), bot-mode protocol, platform hint."""
     parts: list[str] = []
-    if agent.platform != "cloud_customer" and getattr(agent, "_environment_probe", True):
+    if not _is_cloud_customer(agent) and getattr(agent, "_environment_probe", True):
         try:
             from tools.env_probe import get_environment_probe_line
             parts.append(get_environment_probe_line())
@@ -765,7 +771,8 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # Coding posture: the operating brief stays in the stable prefix. The
     # environment block contains the current cwd/backend and belongs after
     # project context, not ahead of a large shared AGENTS.md block.
-    environment_hints = _pb.build_environment_hints()
+    # AI Kosmo: a Cloud customer's prompt names nothing about the host (operator hint, paths, profile).
+    environment_hints = "" if _is_cloud_customer(agent) else _pb.build_environment_hints()
     coding_prefix_parts, coding_workspace_parts, coding_trailing_parts = _coding_parts(agent)
     stable_parts.extend(coding_prefix_parts)
     post_workspace_parts = _post_workspace_parts(agent)
@@ -790,7 +797,8 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     volatile_parts.extend(_plugin_section_blocks(_frozen_plugin_prompt_sections(agent), "after_memory"))
     # The profile line names this home's path, so it rides in the volatile tier: the stable
     # prefix then stays byte-identical across every profile (and home) on the host.
-    volatile_parts.append(_active_profile_line(agent))
+    if not _is_cloud_customer(agent):
+        volatile_parts.append(_active_profile_line(agent))
     volatile_parts.append(_timestamp_line(agent))
     # Keep the renderer-owned runtime anchor after all user/plugin prose so quoted
     # host examples cannot shadow it during persisted-prompt validation.

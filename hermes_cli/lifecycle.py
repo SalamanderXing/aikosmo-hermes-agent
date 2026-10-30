@@ -27,6 +27,12 @@ def _plugin_hooks(hook_name: str, **kwargs: Any) -> list[Any]:
     return plugins.invoke_hook(hook_name, **kwargs)
 
 
+def _cloud_customer(kwargs: dict) -> bool:
+    """AI Kosmo: the restricted Cloud customer runtime never runs staff plugin hooks."""
+    from gateway.kosmi_cloud import CUSTOMER_PLATFORM
+    return kwargs.get("platform") == CUSTOMER_PLATFORM
+
+
 def invoke_hook(hook_name: str, **kwargs: Any) -> list[Any]:
     """Notify first-party observers, then invoke compatibility plugin hooks."""
     from agent.safe_worker_policy import safe_worker_enabled
@@ -34,7 +40,7 @@ def invoke_hook(hook_name: str, **kwargs: Any) -> list[Any]:
     if safe_worker_enabled():
         return []
     _observe(hook_name, **kwargs)
-    if kwargs.get("platform") == "cloud_customer":
+    if _cloud_customer(kwargs):
         return []
     return _plugin_hooks(hook_name, **kwargs)
 
@@ -43,7 +49,7 @@ async def ainvoke_hook(hook_name: str, **kwargs: Any) -> list[Any]:
     """:func:`invoke_hook` for callers on an event loop: same observers-then-plugins
     composition, with ``async def`` plugin callbacks awaited on that loop."""
     _observe(hook_name, **kwargs)
-    if kwargs.get("platform") == "cloud_customer":
+    if _cloud_customer(kwargs):
         return []
     from hermes_cli import plugins
 

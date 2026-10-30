@@ -232,6 +232,8 @@ async def probe(peer):
         staff_prompts = json.dumps([m for r in peer.requests if "ENV_PROBE alice" in json.dumps(r["messages"])
                                     for m in r["messages"] if m["role"] == "system"])
         assert "STAFF_SOUL_SENTINEL" in staff_prompts, "control: a staff turn does see the staff SOUL"
+        assert "STAFF_ENVIRONMENT_HINT_SENTINEL" in staff_prompts, "control: a staff turn sees the host hint"
+        assert str(home) not in prompts, "a customer prompt names no host path or profile home"
         from gateway.session_contract import SessionRef
         agent = authority.agent(SessionRef("default", "customer-one"))
         assert agent.platform == "cloud_customer" and agent.max_iterations == 40
@@ -390,7 +392,7 @@ def main():
     (home / "config.yaml").write_text(
         f"model:\n  default: local-wire-stub\n  provider: custom\n  base_url: {url}\n"
         "streaming:\n  enabled: false\nauxiliary:\n  title_generation:\n    enabled: false\n"
-        "approvals:\n  mode: off\n")
+        "approvals:\n  mode: off\nagent:\n  environment_hint: STAFF_ENVIRONMENT_HINT_SENTINEL\n")
     try:
         asyncio.run(probe(peer))
     finally:
