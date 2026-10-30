@@ -562,8 +562,17 @@ class GatewayTurnPersistenceMixin:
             return None
         # Intentional silence is a delivery decision: the [SILENT] turn stays persisted (alternation).
         if _intentional_silence:
-            logger.info("Suppressing intentional silence marker for session %s", session_entry.session_id)
+            # AI Kosmo: an adapter whose lane already decided this message is owed an answer may return a
+            # stand-in (intentional_silence_replacement); every other adapter, None or a failure suppresses.
             response = ""
+            _replace = getattr(self._delivery_adapter_for(source), "intentional_silence_replacement", None)
+            if callable(_replace):
+                try:
+                    response = _replace(event) or ""
+                except Exception:
+                    logger.exception("Intentional-silence replacement failed for session %s", session_entry.session_id)
+            logger.info("%s intentional silence marker for session %s",
+                        "Replacing" if response else "Suppressing", session_entry.session_id)
 
         adapter = self._delivery_adapter_for(source)
         # Auto voice reply (TTS audio before the text) unless streaming TTS already delivered audio.

@@ -272,7 +272,9 @@ def finalize_webhook(authority, receipt):
             WHERE id=? AND ended_at IS NULL AND runtime_generation=?
               AND EXISTS (SELECT 1 FROM runtime_epoch WHERE singleton=1 AND epoch=?)
               AND EXISTS (SELECT 1 FROM session_admissions WHERE admission_id=?
-                AND target_session_id=? AND status='terminal' AND generation=? AND owner_epoch=?)
+                AND target_session_id=? AND status='terminal' AND generation=? AND owner_epoch=?
+                -- AI Kosmo: a shared thread session (webhook:<route>:thread-<key>) outlives its turns.
+                AND COALESCE(json_extract(payload_json, '$.native_text_v1.source.chat_id'), '') NOT LIKE 'webhook:%:thread-%')
               AND NOT EXISTS (SELECT 1 FROM session_admissions WHERE target_session_id=? AND status!='terminal')
             """, (time.time(), 'webhook_complete', sid, receipt.execution_generation,
                   authority.epoch, receipt.admission_id, sid, receipt.execution_generation,

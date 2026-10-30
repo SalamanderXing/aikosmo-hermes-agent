@@ -43,6 +43,9 @@ from gateway.platforms.webhook_coalesce import WebhookCoalescer, validate_coales
 from gateway.platforms.webhook_filters import DEFAULT_SCRIPT_TIMEOUT_SECONDS, WebhookRouteProcessor
 from gateway.platforms.webhook_mcp_events import (
     handle_mcp_event_control, mcp_event_delivery_id, render_mcp_event_prompt)
+from gateway.platforms.webhook_linear import (
+    RETRY_KEY, SESSION_KEY_KEY, TOOLSET_TIER_KEY, deliver_linear_comment, is_thread_chat, replying_turn,
+    route_tier_toolsets, script_routing, silence_replacement, thread_chat_id, thread_tier, turn_destination)
 from gateway.response_filters import is_autonomous_silence_response
 
 logger = logging.getLogger(__name__)
@@ -336,16 +339,45 @@ class WebhookAdapter(BasePlatformAdapter):
         # Autonomous lane (no human reader): the loose marker matcher shared with cron (marker on its own
         # first/last line), because models add a sentence explaining why they stayed quiet, which the
         # interactive exact-match rule would deliver.
-        if is_autonomous_silence_response(content):
-            logger.info("[webhook] Response for %s is a silence marker — not delivering", chat_id)
-            return SendResult(success=True)
-        from gateway.platforms.webhook_delivery import retained_destination
         try:
-            delivery = retained_destination(self, chat_id)
+            delivery = turn_destination(self, chat_id)
         except Exception:
+            if is_autonomous_silence_response(content):
+                logger.info("[webhook] Response for %s is a silence marker — not delivering", chat_id)
+                return SendResult(success=True)
             logger.warning("[webhook] Destination unavailable for %s", chat_id, exc_info=True)
             return SendResult(success=False, error="Webhook destination unavailable or unauthorized")
+        if is_autonomous_silence_response(content):
+            # The turn's silence site normally replaces a marker on a lane that owes an answer
+            # (intentional_silence_replacement); one still arriving here (a streamed final) gets the same rule.
+            if not (replacement := silence_replacement(delivery)):
+                logger.info("[webhook] Response for %s is a silence marker — not delivering", chat_id)
+                return SendResult(success=True)
+            content = replacement
+        if delivery["deliver"] == "linear_comment" and (metadata or {}).get("notify") is not True:
+            # Only the final answer posts: interim and status sends (fallback-model notices, context-pressure
+            # warnings) reach send() too, and the gateway marks finals and only finals as notify.
+            logger.debug("[webhook] Skipping non-final send for %s (notify not set)", chat_id)
+            return SendResult(success=True)
         return await self._deliver_to(delivery, chat_id, content)
+
+    async def send_final_ledgered(self, event: MessageEvent, *args, **kwargs):
+        """AI Kosmo: name the replying turn for ``send``, which keys a thread chat's answer on it."""
+        token = replying_turn.set(event)
+        try:
+            return await super().send_final_ledgered(event, *args, **kwargs)
+        finally:
+            replying_turn.reset(token)
+
+    def intentional_silence_replacement(self, event: MessageEvent) -> Optional[str]:
+        """AI Kosmo: what this turn's intentional silence becomes; None keeps the suppression. A
+        linear_comment lane whose gate decided the comment is owed an answer acknowledges instead."""
+        try:
+            return silence_replacement(turn_destination(self, event.source.chat_id, event))
+        except Exception:
+            logger.warning("[webhook] Destination unavailable for %s; keeping the silence", event.source.chat_id,
+                           exc_info=True)
+            return None
 
     async def _deliver_to(self, delivery: dict[str, Any], chat_id: str, content: str) -> SendResult:
         deliver_type = delivery["deliver"]
@@ -354,6 +386,8 @@ class WebhookAdapter(BasePlatformAdapter):
             return SendResult(success=True)
         if deliver_type == "github_comment":
             return await self._deliver_github_comment(content, delivery)
+        if deliver_type == "linear_comment":
+            return await deliver_linear_comment(content, delivery)
         if self.gateway_runner and _is_known_platform(deliver_type):
             return await self._deliver_cross_platform(deliver_type, content, delivery)
         logger.warning("[webhook] Unknown deliver type: %s", deliver_type)
@@ -418,10 +452,25 @@ class WebhookAdapter(BasePlatformAdapter):
         if not user_id.startswith("webhook:"):
             return None
         route_config = self._routes.get(user_id[len("webhook:"):])
+        if isinstance(route_config, dict) and route_config.get("toolset_tiers"):
+            # AI Kosmo: the tier the route script recorded on this chat's delivery admission.
+            if tiered := route_tier_toolsets(route_config, self._chat_tier(str(getattr(source, "chat_id", "") or ""))):
+                return tiered
         toolsets = route_config.get("toolsets") if isinstance(route_config, dict) else None
         if not isinstance(toolsets, list):
             return None
         return [str(t).strip() for t in toolsets if str(t).strip()] or None
+
+    def _chat_tier(self, chat_id: str) -> Optional[str]:
+        """The toolset tier recorded on a chat's delivery; None (the route default) when unreadable."""
+        try:
+            if is_thread_chat(chat_id):
+                return thread_tier(self, chat_id)
+            from gateway.platforms.webhook_delivery import retained_destination
+            return retained_destination(self, chat_id).get("toolset_tier")
+        except Exception:
+            logger.warning("[webhook] No recorded tier for %s; using the route's toolsets", chat_id, exc_info=True)
+            return None
 
     # --- HTTP handlers ---
 
@@ -715,6 +764,10 @@ class WebhookAdapter(BasePlatformAdapter):
         # Script, prompt render and skill lookup read the profile's home (skills/, config); the runner
         # only enters the routed profile's scope later around handle_message, so enter it here.
         # See #67277.
+        if isinstance(payload, dict):
+            # AI Kosmo: reserved route-script outputs, stripped so only the script can set them.
+            for reserved in (TOOLSET_TIER_KEY, SESSION_KEY_KEY, RETRY_KEY):
+                payload.pop(reserved, None)
         with self._profile_scope(profile):
             script = route_config.get("script")
             if script:
@@ -725,6 +778,11 @@ class WebhookAdapter(BasePlatformAdapter):
                 if not keep:
                     logger.info("[webhook] script ignored event=%s route=%s", event_type, route_name)
                     return web.json_response({"status": "ignored", "reason": "script", "route": route_name})
+                if isinstance(transformed_payload, dict) and transformed_payload.get(RETRY_KEY) is True:
+                    # The script could not read canonical context: retryable, before any delivery is recorded.
+                    logger.error("[webhook] script requested retry route=%s", route_name)
+                    return web.json_response(
+                        {"error": "Route script temporarily unavailable", "route": route_name}, status=503)
                 payload = transformed_payload or payload
             prompt = (render_mcp_event_prompt(self, route_config, payload, event_type, route_name)
                       or self._render_prompt(route_config.get("prompt", ""), payload, event_type, route_name))
@@ -787,12 +845,12 @@ class WebhookAdapter(BasePlatformAdapter):
         task.add_done_callback(self._background_tasks.discard)
         return task
 
-    def _admission_source(self, route_name: str, profile, delivery_id: str):
+    def _admission_source(self, route_name: str, profile, delivery_id: str, chat_id: Optional[str] = None):
         """The ``SessionSource`` admission builds for one delivery, ``profile_routes`` resolved on it.
         The edge's coalesced-route check (``parked_profile_refusal``) asks this same source, so a
-        route rule matches there exactly when it matches at admission."""
+        route rule matches there exactly when it matches at admission. ``chat_id``: a thread session's."""
         identity = _WebhookDeliveryIdentity.from_parts(profile, route_name, delivery_id)
-        source = self.build_source(chat_id=identity.session_chat_id, chat_name=f"webhook/{route_name}",
+        source = self.build_source(chat_id=chat_id or identity.session_chat_id, chat_name=f"webhook/{route_name}",
                                    chat_type="webhook", user_id=f"webhook:{route_name}", user_name=route_name)
         if profile and isinstance(profile, str):
             # The ``/p/<profile>/`` prefix names the profile and wins over ``profile_routes``; the
@@ -808,18 +866,21 @@ class WebhookAdapter(BasePlatformAdapter):
         and coalesced paths). ``"accepted"`` / ``"duplicate"``, or None when admission failed."""
         # (profile, route, delivery_id) in the session key → concurrent webhooks get independent runs.
         identity = _WebhookDeliveryIdentity.from_parts(profile, route_name, delivery_id)
-        session_chat_id = identity.session_chat_id
+        # AI Kosmo staff lane: a route script may name a toolset tier and a shared (thread) session.
+        tier, thread_key = script_routing(route_config, payload)
+        session_chat_id = thread_chat_id(route_name, thread_key) if thread_key else identity.session_chat_id
         # ``profile`` rides along so the reply leg (``send`` → ``_deliver_cross_platform``) egresses through
         # THIS profile's adapter, home channel and secrets — not the first profile that has the platform.
         self._delivery_info[session_chat_id] = {
             "deliver": route_config.get("deliver", "log"), "profile": profile,
             "deliver_extra": self._render_delivery_extra(route_config.get("deliver_extra", {}), payload),
             "route": route_name,
-            "mirror": route_config.get("mirror_to_session") is True}
+            "mirror": route_config.get("mirror_to_session") is True,
+            **({"toolset_tier": tier} if tier else {})}
         self._delivery_info_created[session_chat_id] = now
         self._delivery_info_order.append((now, session_chat_id))
         self._prune_delivery_info(now)
-        source = self._admission_source(route_name, profile, delivery_id)
+        source = self._admission_source(route_name, profile, delivery_id, chat_id=session_chat_id)
         # reply_expected=False: an autonomous lane has no human waiting on this turn, so a bare silence marker
         # stays silent instead of being replaced by the gateway's "unexpected silence" notice (run_turn's
         # silence_allowed). A lane that owes a reply anyway must say so itself.
@@ -1000,6 +1061,10 @@ class WebhookAdapter(BasePlatformAdapter):
             return SendResult(success=True)
         if deliver_type == "github_comment":
             return await self._deliver_github_comment(content, delivery)
+        if deliver_type == "linear_comment":
+            # No agent session, so no delivery id to key the create on: refusing beats a duplicate.
+            logger.error("[webhook] linear_comment is not available in deliver_only mode")
+            return SendResult(success=False, error="linear_comment requires an agent run (no deliver_only)")
         return await self._deliver_cross_platform(deliver_type, content, delivery)
 
     async def _deliver_github_comment(self, content: str, delivery: dict) -> SendResult:
