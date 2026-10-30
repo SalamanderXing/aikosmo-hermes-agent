@@ -596,6 +596,18 @@ def _codex_turn_service_tier(agent) -> str | None:
     return CODEX_TIER_WORDS.get(effective_request_overrides(agent).get("service_tier"))
 
 
+def _approval_bypass_active() -> bool:
+    """Gateway/cron have no UI for codex approval requests, so exec/apply_patch fail closed by default;
+    only an explicit approval bypass (approvals.mode: off, /yolo, --yolo, HERMES_YOLO_MODE) hands policy to
+    codex's sandbox."""
+    try:
+        from tools.approval import is_approval_bypass_active
+        return is_approval_bypass_active()
+    except Exception:
+        logger.debug("codex app-server: approval-bypass lookup failed; keeping fail-closed default", exc_info=True)
+        return False
+
+
 def _ensure_codex_session(agent, messages: list[dict[str, Any]] | None = None) -> None:
     """Lazily spawn one CodexAppServerSession per AIAgent (reused across turns, closed by the _cleanup hook).
     A live session whose thread was started with a different prompt composition (TUI/Desktop ``/personality``
@@ -612,6 +624,11 @@ def _ensure_codex_session(agent, messages: list[dict[str, Any]] | None = None) -
         recorded = getattr(agent, "_codex_session_prompt", None)
         if recorded is None or (recorded == developer_instructions
                                 and getattr(agent, "_codex_session_model_provider", None) == model_provider):
+            # AI Kosmo: the approval bypass can be turn-scoped (an unattended webhook turn), so a reused
+            # session takes this turn's, never the one it was spawned under.
+            bypass = _approval_bypass_active()
+            routing = agent._codex_session._routing
+            routing.auto_approve_exec = routing.auto_approve_apply_patch = bypass
             return
         _close_codex_session(agent)
     resume_thread_id = None if getattr(agent, "_codex_session_prompt", None) is not None else _stored_codex_thread_id(agent)
@@ -627,14 +644,7 @@ def _ensure_codex_session(agent, messages: list[dict[str, Any]] | None = None) -
         from tools.terminal_tool import _get_approval_callback
         if not _no_user_can_answer():
             approval_callback = _get_approval_callback()
-    # Gateway/cron have no UI for codex approval requests, so exec/apply_patch fail closed by default. Only an
-    # explicit approval bypass (approvals.mode: off, /yolo, --yolo, HERMES_YOLO_MODE) hands policy to codex's sandbox.
-    auto_approve_requests = False
-    try:
-        from tools.approval import is_approval_bypass_active
-        auto_approve_requests = is_approval_bypass_active()
-    except Exception:
-        logger.debug("codex app-server: approval-bypass lookup failed; keeping fail-closed default", exc_info=True)
+    auto_approve_requests = _approval_bypass_active()
     # Bridge codex JSON-RPC notifications (item/started, item/completed, item/agentMessage/delta, ...) into
     # Hermes' gateway UI callbacks (tool_progress_callback, _fire_stream_delta,
     # _emit_interim_assistant_message). Without this, Discord/Telegram users see no live tool-progress or
