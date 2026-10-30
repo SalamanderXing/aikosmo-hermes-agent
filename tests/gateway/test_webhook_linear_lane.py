@@ -50,6 +50,7 @@ async def gateway(peer, posted):
     from gateway.run import GatewayRunner
     from gateway.session_authority import initialize_session_authority
     runner = GatewayRunner()
+    runner._running = True  # a started gateway: plugin injection (t3-events) accepts only then
     authority = await initialize_session_authority(runner, profile_id="default", instance_id=f"lane-{len(posted)}")
     adapter = WebhookAdapter(PlatformConfig(enabled=True, extra={
         "host": "127.0.0.1", "port": 0, "secret": _SECRET.decode(), "routes": {"linear-comment": dict(ROUTE)}}))
@@ -148,11 +149,13 @@ async def probe(peer):
             (D["4"], webhook_linear.LINEAR_SILENCE_ACK)]
 
         # A gateway-started turn (a T3 state event) answers in the thread under a reply id of its own.
+        # The exact call t3_events.deliver_pending makes (hermes/t3ctl bin/t3-events in the monorepo).
         entry = runner.session_store.lookup_by_session_key(authority.sessions[thread_sid].route)
-        source = authority.sessions[thread_sid].source
-        assert await runner._admit_plugin_injection(
-            adapter, source, session_key=entry.session_key, session_id=entry.session_id,
-            content="[T3 STATE EVENT] TAG-tee", plugin_id="t3-events")
+        assert not await runner._dispatch_plugin_message_injection(
+            session_key=entry.session_key, content="stale", plugin_id="t3-events", expected_session_id="reset-since")
+        assert await runner._dispatch_plugin_message_injection(
+            session_key=entry.session_key, content="[T3 STATE EVENT] TAG-tee", plugin_id="t3-events",
+            expected_session_id=entry.session_id)
         await async_wait_until(lambda: any(c["body"] == "ANSWER TAG-tee" for c in posted), timeout=40,
                                what="the T3 turn's answer")
         tee = next(c for c in posted if c["body"] == "ANSWER TAG-tee")
