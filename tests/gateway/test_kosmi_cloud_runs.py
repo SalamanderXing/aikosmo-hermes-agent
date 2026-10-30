@@ -155,6 +155,28 @@ async def probe(peer):
                    for p in stored), stored
         assert any("IMAGE_TURN" in str(p.get("text", "")) for p in stored), stored
 
+        # The backend's personal-chat flow (apps/backend kosmi-sessions.ts hermesClient): its own session id,
+        # a keyed run, then the transcript, listing and deletion through the session routes.
+        async with client.post(base + "/api/sessions", headers=auth,
+                               json={"id": "kosmi_flow", "source": "api_server"}) as response:
+            assert response.status in (200, 201), await response.text()
+            assert (await response.json())["session"]["id"] == "kosmi_flow"
+        keyed = {**auth, "Idempotency-Key": "flow-1"}
+        body = {"session_id": "kosmi_flow", "input": "FLOW_TURN hello", "cloud_access_token": "alice-token"}
+        flow = await start("/v1/runs/cloud", body, keyed)
+        assert await start("/v1/runs/cloud", body, keyed) == flow, "a keyed repeat returns the accepted run"
+        assert (await finish(flow))["status"] == "completed"
+        async with client.get(f"{base}/api/sessions/kosmi_flow/messages", headers=auth) as response:
+            transcript = await response.json()
+            assert response.status == 200, transcript
+        # The backend projection reads only user/assistant/tool rows (hermes-messages.ts).
+        chat = [(m["role"], m["content"]) for m in transcript["data"] if m["role"] in ("user", "assistant")]
+        assert chat == [("user", "FLOW_TURN hello"), ("assistant", "LOCAL_ACK")], transcript
+        async with client.get(f"{base}/api/sessions?limit=50", headers=auth) as response:
+            assert any(row["id"] == "kosmi_flow" for row in (await response.json())["data"])
+        async with client.delete(f"{base}/api/sessions/kosmi_flow", headers=auth) as response:
+            assert response.status == 200, await response.text()
+
         # Customer runtime: the effective tools and system prompt the model receives.
         upload = base64.b64encode(b"HTTP_UPLOAD_CONTENT").decode()
         customer_id = await start("/v1/runs/cloud/customer", {
