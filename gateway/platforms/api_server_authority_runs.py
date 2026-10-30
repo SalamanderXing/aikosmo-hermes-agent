@@ -92,9 +92,14 @@ def run_projection(adapter, run_id):
         pending = list(live.controls.snapshot(row['target_session_id'], row['generation']))
         if any(prompt.get('kind') == 'approval' for prompt in pending):
             status = 'waiting_for_approval'  # the documented run state main's run store reports
+    # AI Kosmo: a failed run says why, redacted as the run's own SSE failure is (the Cloud shows it).
+    failure = {}
+    if status == 'failed' and result.get('error'):
+        from gateway.platforms.api_server import _redact_api_error_text
+        failure = {'error': _redact_api_error_text(result['error'])}
     return {'pending_controls': pending, 'run_id': run_id, 'status': status, 'session_id': row['target_session_id'],
             'admission_id': row['admission_id'], 'execution_generation': row['generation'],
-            'output': result.get('final_response', ''), 'usage': saved.get('usage', {}) if saved else {}}
+            'output': result.get('final_response', ''), 'usage': saved.get('usage', {}) if saved else {}, **failure}
 
 
 async def send_clarify(adapter, *, chat_id, **kwargs):

@@ -262,6 +262,15 @@ async def recover(peer):
     kept_tools = sorted({t["function"]["name"] for r in peer.requests if "KEPT_TURN" in json.dumps(r["messages"])
                          for t in r.get("tools", [])})
     assert kept_tools == CUSTOMER_TOOLS, kept_tools
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as client:
+        # What the Cloud reconciler polls (kosmi-sessions.ts TERMINAL_RUN_STATUSES) for the turns the restart cut.
+        async def polled(run_id):
+            async with client.get(f"{base}/v1/runs/{run_id}", headers=auth) as response:
+                assert response.status == 200, await response.text()
+                return await response.json()
+        cut, refused = await polled(running), await polled(lost)
+        assert cut["status"] in ("cancelled", "interrupted", "failed"), cut
+        assert refused["status"] == "failed" and "Send it again" in (refused.get("error") or ""), refused
     await adapter.disconnect()
     for file in home.rglob("*"):
         if file.is_file():
