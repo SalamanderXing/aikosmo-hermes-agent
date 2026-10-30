@@ -842,13 +842,45 @@ class WebhookAdapter(BasePlatformAdapter):
                 await self._deliver_to(snapshot_destination(self, self._delivery_info.get(session_chat_id)),
                                        session_chat_id, reply)
             return "accepted"
+        await self._start_finalization(event, receipt)
+        return "accepted"
+
+    async def admit_followup(self, event: MessageEvent, delivery: dict) -> Optional[asyncio.Task]:
+        """AI Kosmo: admit a turn on an existing delivery's chat (operator feedback on an auto-demo run), as the
+        delivery itself was admitted: same validated destination, same route yolo, same finalization. Returns
+        the finalization task (it resolves once the turn settled and its session is closed again), or None
+        when a plugin consumed the turn and nothing was committed."""
+        self._delivery_info[event.source.chat_id] = delivery
+        self._delivery_info_created[event.source.chat_id] = now = time.time()
+        self._delivery_info_order.append((now, event.source.chat_id))
+        self._prune_delivery_info(now)
+        from gateway.platforms.webhook_ingress import admit_producer
+        receipt = await admit_producer(self, event)
+        return None if receipt is None else await self._start_finalization(event, receipt)
+
+    async def _start_finalization(self, event, receipt) -> asyncio.Task:
         from gateway.session_authorities import active_authority, authority_for_profile_id
         runner = self._message_handler.__self__
         authority = authority_for_profile_id(runner, receipt.ref.profile_id) or active_authority(runner)
         task = asyncio.create_task(self._finalize_delivery(event, authority, receipt))
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
-        return "accepted"
+        return task
+
+    def _route_for_source(self, source) -> dict:
+        """Config of the route that minted this source, keyed on its ``webhook:{route}`` user id as
+        ``toolsets_for_source`` is (the chat id is an opaque per-delivery token)."""
+        user_id = str(getattr(source, "user_id", "") or "")
+        route = self._routes.get(user_id[len("webhook:"):]) if user_id.startswith("webhook:") else None
+        return route if isinstance(route, dict) else {}
+
+    def unattended_yolo(self, source) -> bool:
+        """AI Kosmo per-route ``yolo: true``, asked by the turn's preparation (``_hmwa_prepare_turn``) for
+        every turn of a delivery's session, a replay after a restart included. A webhook route is an
+        unattended lane: a pending approval has no human behind it, times out and auto-denies, which kills
+        the run. The delivery's finalization releases the session's bypass once it closes the session. Session
+        yolo is not a full bypass: the hardline blocklist in tools.approval still applies."""
+        return self._route_for_source(source).get("yolo") is True
 
     async def _finalize_delivery(self, event, authority, receipt):
         from hermes_state_runtime import get_session_admission
@@ -869,7 +901,11 @@ class WebhookAdapter(BasePlatformAdapter):
         binding = getattr(event, '_webhook_receipt', None)
         if binding is not None:
             authority, receipt = binding
-            finalize_webhook(authority, receipt)
+            # Only a close releases the route's yolo: another turn of this session (operator feedback) still
+            # queued or running keeps the session open, and keeps its bypass.
+            if finalize_webhook(authority, receipt) and self.unattended_yolo(event.source):
+                from tools.approval import disable_session_yolo
+                disable_session_yolo(self._message_handler.__self__._session_key_for_source(event.source))
 
     # --- Signature validation ---
 

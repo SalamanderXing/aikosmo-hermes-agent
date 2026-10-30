@@ -640,6 +640,25 @@ def _clear_turn_process_ownership(agent: Any) -> None:
     agent._gateway_turn_process_epoch = None
 
 
+def session_attachment_directory(session_id: str) -> Path:
+    """Where one session's uploaded documents are staged."""
+    safe_session_id = re.sub(r"[^a-zA-Z0-9._-]", "-", session_id)[:128] or "session"
+    return Path.cwd() / ".hermes" / "api-attachments" / safe_session_id
+
+
+def decode_data_url(data_url: Any) -> tuple[str, bytes]:
+    """``(mime type, bytes)`` of a base64 ``data:`` URL; ValueError (``code:message``) otherwise."""
+    if not isinstance(data_url, str) or "," not in data_url:
+        raise ValueError("invalid_content_part:File parts must include base64 file_data.")
+    header, encoded = data_url.split(",", 1)
+    if not header.startswith("data:") or ";base64" not in header.lower():
+        raise ValueError("invalid_content_part:File parts must use a base64 data URL.")
+    try:
+        return header[len("data:"):].split(";", 1)[0].strip().lower(), base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError("invalid_content_part:File data is not valid base64.") from exc
+
+
 def _stage_session_file_parts(content: Any, session_id: str) -> Any:
     """Turn authenticated API file parts into bounded workspace @file refs."""
     if not isinstance(content, list):
@@ -652,8 +671,7 @@ def _stage_session_file_parts(content: Any, session_id: str) -> Any:
     if len(file_parts) > MAX_SESSION_ATTACHMENT_COUNT:
         raise ValueError(f"invalid_content_part:At most {MAX_SESSION_ATTACHMENT_COUNT} files may be attached.")
 
-    safe_session_id = re.sub(r"[^a-zA-Z0-9._-]", "-", session_id)[:128] or "session"
-    attachment_dir = Path.cwd() / ".hermes" / "api-attachments" / safe_session_id
+    attachment_dir = session_attachment_directory(session_id)
     decoded_files: list[tuple[str, str, bytes]] = []
     total_bytes = 0
     for part in file_parts:
@@ -662,16 +680,7 @@ def _stage_session_file_parts(content: Any, session_id: str) -> Any:
         extension = Path(safe_name).suffix.lower()
         if not safe_name or extension not in SESSION_ATTACHMENT_EXTENSIONS:
             raise ValueError("unsupported_content_type:This document type is not supported.")
-        data_url = part.get("file_data")
-        if not isinstance(data_url, str) or "," not in data_url:
-            raise ValueError("invalid_content_part:File parts must include base64 file_data.")
-        header, encoded = data_url.split(",", 1)
-        if not header.startswith("data:") or ";base64" not in header.lower():
-            raise ValueError("invalid_content_part:File parts must use a base64 data URL.")
-        try:
-            file_bytes = base64.b64decode(encoded, validate=True)
-        except (binascii.Error, ValueError) as exc:
-            raise ValueError("invalid_content_part:File data is not valid base64.") from exc
+        _mime, file_bytes = decode_data_url(part.get("file_data"))
         total_bytes += len(file_bytes)
         if total_bytes > MAX_SESSION_ATTACHMENT_BYTES:
             raise ValueError("invalid_content_part:Attached files exceed the 5 MB total limit.")
@@ -1185,6 +1194,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         extra = config.extra or {}
         self._host, self._port = listen_address(extra)
         self._api_key: str = extra.get("key", _get_scoped_secret("API_SERVER_KEY", ""))
+        # AI Kosmo: serve only the authenticated health and webhook-delivery routes, no agent control.
+        self._delivery_status_only: bool = _coerce_request_bool(extra.get("delivery_status_only"), default=False)
         self._cors_origins: tuple[str, ...] = self._parse_cors_origins(
             extra.get("cors_origins", os.getenv("API_SERVER_CORS_ORIGINS", "")))
         self._model_name: str = self._resolve_model_name(
@@ -1709,10 +1720,17 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     def _http_route_table(self) -> list[tuple]:
         """(method, path, handler) rows registered by ``connect()`` (a method so multiplex tests
         can assert the /p/<profile>/ mirrors without a listener)."""
-        routes: list[tuple] = [
+        status_routes: list[tuple] = [
             ("GET", "/health", self._handle_health),
             ("GET", "/health/detailed", self._handle_health_detailed),
             ("GET", "/v1/health", self._handle_health),
+            ("GET", "/api/webhook-deliveries/{delivery_id}", self._handle_webhook_delivery),
+            ("GET", "/api/webhook-deliveries/{delivery_id}/session", self._handle_webhook_delivery_session),
+            ("POST", "/api/webhook-deliveries/{delivery_id}/feedback", self._handle_webhook_delivery_feedback)]
+        if self._delivery_status_only:
+            return status_routes
+        routes: list[tuple] = [
+            *status_routes,
             ("GET", "/v1/models", self._handle_models),
             ("GET", "/api/model/options", self._handle_model_options),
             ("GET", "/v1/capabilities", self._handle_capabilities),
@@ -1755,6 +1773,47 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             # Chronos fire webhook (NAS -> agent): authenticated by a NAS-minted JWT.
             routes.append(("POST", "/api/cron/fire", self._handle_cron_fire))
         return routes
+
+    # -- AI Kosmo: webhook deliveries (gateway/platforms/webhook_status.py) -----------
+
+    async def _handle_webhook_delivery(self, request: web.Request) -> web.Response:
+        """Content-free status of a ``durable_status`` webhook delivery."""
+        if auth_err := self._check_auth(request):
+            return auth_err
+        from gateway.platforms.webhook_status import delivery_status
+        status = await asyncio.to_thread(delivery_status, self.gateway_runner, request.match_info["delivery_id"])
+        if status is None:
+            return web.json_response({"error": "Delivery not found"}, status=404)
+        return web.json_response(status)
+
+    async def _handle_webhook_delivery_session(self, request: web.Request) -> web.Response:
+        """The persisted transcript of one auto-demo delivery."""
+        if auth_err := self._check_auth(request):
+            return auth_err
+        from gateway.platforms.webhook_status import delivery_transcript
+        delivery_id = request.match_info["delivery_id"]
+        found = await asyncio.to_thread(delivery_transcript, self.gateway_runner, delivery_id)
+        if found is None:
+            return web.json_response({"error": "Delivery not found"}, status=404)
+        session, messages = found
+        return web.json_response({
+            "delivery_id": delivery_id, "session": self._session_response(session),
+            "messages": [self._message_response(message) for message in messages]})
+
+    async def _handle_webhook_delivery_feedback(self, request: web.Request) -> web.Response:
+        """Run one operator-feedback turn in an auto-demo delivery's original session and wait for it."""
+        if auth_err := self._check_auth(request):
+            return auth_err
+        body, err = await self._read_json_body(request)
+        if err:
+            return err
+        from gateway.platforms.webhook_status import FeedbackRefused, run_feedback
+        try:
+            result = await run_feedback(self.gateway_runner, request.match_info["delivery_id"],
+                                        body.get("message") or body.get("input"))
+        except FeedbackRefused as exc:
+            return web.json_response({"error": str(exc)}, status=exc.status)
+        return web.json_response(result, status=200 if result["status"] == "completed" else 502)
 
     # -- Session header helpers -------------------------------------------------------
 

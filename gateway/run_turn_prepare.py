@@ -639,6 +639,12 @@ class GatewayTurnPrepareMixin:
         from tools.approval_yolo import restore_gateway_yolo
         _was_auto_reset, _is_new_session = await self._hmwa_open_session(session_entry, session_key, source)
         restore_gateway_yolo(session_key, session_entry.yolo)  # None: TurnRunner seeds the launch policy
+        # AI Kosmo: a lane its adapter runs unattended (webhook ``yolo: true`` routes) is approval-free for each
+        # of its turns; the adapter releases the bypass when the lane's session closes.
+        _unattended = getattr(self._adapter_for_source(source), "unattended_yolo", None)
+        if callable(_unattended) and _unattended(source) is True:
+            from tools.approval import enable_session_yolo
+            enable_session_yolo(session_key)
         context = build_session_context(source, self.config, session_entry)
         # Session context variables for tools (task-local, concurrency-safe)
         _session_env_tokens = self._set_session_env(context)
