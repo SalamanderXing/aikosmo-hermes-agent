@@ -55,6 +55,14 @@ _SESSION_VARS = (
 _SESSION_TURN_EVENT: ContextVar[Any] = ContextVar("HERMES_SESSION_TURN_EVENT", default=None)
 _ACTOR_VAR_NAMES = frozenset({"HERMES_SESSION_ACTOR_ID", "HERMES_SESSION_ACTOR_NAME"})
 
+
+# Private execution credential: deliberately excluded from public session metadata.
+kosmo_cli_access_token: ContextVar[str | None] = ContextVar("kosmo_cli_access_token", default=None)
+kosmo_attachment_root: ContextVar[str | None] = ContextVar("kosmo_attachment_root", default=None)
+# Customer runs: the only hotel slugs the run's kosmo-cli session may touch.
+kosmo_cli_restricted_hotel_slugs: ContextVar[tuple[str, ...] | None] = ContextVar(
+    "kosmo_cli_restricted_hotel_slugs", default=None)
+
 # Whether this channel can route an ASYNC completion back AFTER the turn ends (see
 # ``async_delivery_supported()``).  _UNSET => supported (CLI, contextvar-unaware paths); stateless
 # adapters (API server, Kanban workers) opt OUT via ``supports_async_delivery = False`` at bind.

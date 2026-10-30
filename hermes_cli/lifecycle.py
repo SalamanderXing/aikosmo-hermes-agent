@@ -34,6 +34,8 @@ def invoke_hook(hook_name: str, **kwargs: Any) -> list[Any]:
     if safe_worker_enabled():
         return []
     _observe(hook_name, **kwargs)
+    if kwargs.get("platform") == "cloud_customer":
+        return []
     return _plugin_hooks(hook_name, **kwargs)
 
 
@@ -41,6 +43,8 @@ async def ainvoke_hook(hook_name: str, **kwargs: Any) -> list[Any]:
     """:func:`invoke_hook` for callers on an event loop: same observers-then-plugins
     composition, with ``async def`` plugin callbacks awaited on that loop."""
     _observe(hook_name, **kwargs)
+    if kwargs.get("platform") == "cloud_customer":
+        return []
     from hermes_cli import plugins
 
     return await plugins.ainvoke_hook(hook_name, **kwargs)

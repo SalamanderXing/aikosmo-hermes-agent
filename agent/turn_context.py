@@ -1166,8 +1166,7 @@ def _append_multimodal_context(
     appended = append_notes_to_multimodal_content(turn_user_msg.get("content"), _mm_ctx)
     if not appended and typed_ask_text(turn_user_msg) is None:
         return
-    from agent.session_persistence import _persist_lock
-    from session_rules.turns import _durable_content
+    from agent.session_persistence import _durable_row_content, _persist_lock
 
     with _persist_lock(agent):
         _row_id = turn_user_msg.get("_row_id")
@@ -1178,7 +1177,8 @@ def _append_multimodal_context(
         _store = agent_interface(agent)
         _db = _store.messages if _store is not None else _db
         _in_place_compacted = preflight_compressed and bool(getattr(agent, "_last_compaction_in_place", False))
-        content = turn_user_msg["content"] if _in_place_compacted else _durable_content(turn_user_msg["content"])
+        content = (turn_user_msg["content"] if _in_place_compacted
+                   else _durable_row_content(agent, "user", turn_user_msg["content"]))
         try:
             _db.set_user_message_content(agent.session_id, _row_id, content, typed_ask_fields(turn_user_msg))
         except Exception:

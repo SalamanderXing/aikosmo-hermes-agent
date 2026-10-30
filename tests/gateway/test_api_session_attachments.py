@@ -4,9 +4,10 @@ from pathlib import Path
 import pytest
 
 from gateway.platforms.api_server import _stage_session_file_parts
+from hermes_constants import get_hermes_home
 
 
-def test_session_file_parts_are_staged_as_workspace_references(tmp_path: Path, monkeypatch) -> None:
+def test_session_file_parts_are_staged_on_the_persistent_home(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)
 
     content = _stage_session_file_parts(
@@ -18,11 +19,13 @@ def test_session_file_parts_are_staged_as_workspace_references(tmp_path: Path, m
     )
 
     assert content[0] == {"type": "input_text", "text": "Read this"}
-    reference = content[1]["text"].splitlines()[-1].removeprefix("@file:")
-    staged = tmp_path / reference
+    staged = Path(content[1]["text"].splitlines()[-1].removeprefix("@file:"))
+    # Absolute, so a tool in another working directory reads it; under HERMES_HOME, so it survives
+    # replacing the gateway's working directory.
+    assert staged.is_absolute() and staged.parent == get_hermes_home() / "api-attachments" / "session-one"
     assert staged.read_text(encoding="utf-8") == "hello"
-    assert staged.parent.name == "session-one"
     assert staged.name.endswith("guest-notes.txt")
+    assert not (tmp_path / ".hermes").exists()
 
 
 def test_invalid_session_file_parts_leave_no_staged_files(tmp_path: Path, monkeypatch) -> None:
@@ -34,4 +37,4 @@ def test_invalid_session_file_parts_leave_no_staged_files(tmp_path: Path, monkey
             "session-one",
         )
 
-    assert not (tmp_path / ".hermes").exists()
+    assert not (get_hermes_home() / "api-attachments" / "session-one").exists()

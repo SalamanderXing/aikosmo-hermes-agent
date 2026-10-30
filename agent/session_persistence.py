@@ -24,7 +24,7 @@ from agent.message_metadata import (
 from session_rules.turns import message_uid_or_none, _durable_content, _is_ephemeral_scaffolding
 from agent.transcript_repair import sync_flushed_message_markers
 from persistence.conversation.messages import NewMessage, RowDisposition
-from session_rules.turns import _EPHEMERAL_SCAFFOLDING_FLAGS, _IMAGE_PART_TYPES
+from session_rules.turns import _EPHEMERAL_SCAFFOLDING_FLAGS, _IMAGE_PART_TYPES, _is_multimodal_tool_result
 
 
 logger = logging.getLogger("run_agent")  # origin module's name: log records / caplog filters unchanged
@@ -97,6 +97,16 @@ def _summary_display_kind(msg: dict) -> Any:
     ):
         return "hidden"
     return msg.get("display_kind")
+
+
+def _durable_row_content(agent: Any, role: Any, content: Any) -> Any:
+    """``_durable_content`` except API user messages, which keep native image parts so Cloud history and
+    resumed API conversations retain the image itself (other platforms and tool results keep the text
+    projection)."""
+    if (role == "user" and getattr(agent, "platform", None) == "api_server" and isinstance(content, list)
+            and not _is_multimodal_tool_result(content)):
+        return content
+    return _durable_content(content)
 
 
 def _persist_lock(agent):
@@ -199,7 +209,7 @@ def _db_flush_row(agent, msg: dict, is_current_turn_user: bool) -> dict[str, Any
         api_content = content
     # Key order is the divert-JSONL wire order (divert_session_transcript_jsonl).
     row = {
-        "role": role, "content": _durable_content(content),
+        "role": role, "content": _durable_row_content(agent, role, content),
         "tool_name": msg.get("tool_name") or (msg.get("name") if role == "tool" else None),
         "tool_calls": msg["tool_calls"] if isinstance(msg.get("tool_calls"), list) else None,
         "tool_call_id": msg.get("tool_call_id"), "effect_disposition": msg.get("effect_disposition"),

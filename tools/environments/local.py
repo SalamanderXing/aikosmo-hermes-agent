@@ -260,9 +260,14 @@ def _inject_session_context_env(env: dict) -> None:
     Tier 2), so a value never puts back a credential the scrub removed; ``None`` unsets a name."""
     try:
         from gateway.session_context import (
-            _UNSET, _VAR_MAP, _bound_session_value, session_context_engaged)
+            _UNSET, _VAR_MAP, _bound_session_value, kosmo_cli_access_token, session_context_engaged)
     except Exception:
         return
+    cli_token = kosmo_cli_access_token.get()
+    if cli_token is None:
+        env.pop("KOSMO_CLI_AUTH_ACCESS_TOKEN", None)
+    else:
+        env["KOSMO_CLI_AUTH_ACCESS_TOKEN"] = cli_token
     _engaged = session_context_engaged()
     for var_name in _VAR_MAP:
         value = _bound_session_value(var_name)
