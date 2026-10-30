@@ -9,6 +9,7 @@ import hmac
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import time
@@ -48,14 +49,14 @@ async def probe(peer):
     from gateway.run import GatewayRunner
     from gateway.session_authority import initialize_session_authority
     from tests.waiting import async_wait_until
-    from tools.approval import is_session_yolo_enabled, disable_session_yolo
+    from tools import approval
 
     runner = GatewayRunner()
     authority = await initialize_session_authority(runner, profile_id="default", instance_id="delivery-test")
     adapter = WebhookAdapter(PlatformConfig(enabled=True, extra={
         "host": "127.0.0.1", "port": 0, "secret": _SECRET.decode(),
-        "routes": {"auto-demo": {"prompt": "{text}", "durable_status": True, "yolo": True},
-                   "plain": {"prompt": "{text}"}}}))
+        "routes": {"auto-demo": {"prompt": "{text}", "durable_status": True, "yolo": True, "toolsets": ["terminal"]},
+                   "plain": {"prompt": "{text}", "toolsets": ["terminal"]}}}))
     adapter.gateway_runner = runner
     runner.adapters[Platform.WEBHOOK] = adapter
     runner._wire_adapter_handlers(adapter)
@@ -75,10 +76,6 @@ async def probe(peer):
     async def status(delivery_id):
         return await asyncio.to_thread(delivery_status, runner, delivery_id)
 
-    def session_key(delivery_id):
-        row = authority.db._read_all("SELECT target_session_id FROM session_admissions WHERE request_id=?", (delivery_id,))[0]
-        return authority.sessions[row["target_session_id"]].route
-
     try:
         async with aiohttp.ClientSession() as client:
             # Queued: committed, not yet claimed (execution held at scheduling).
@@ -90,9 +87,6 @@ async def probe(peer):
             assert queued["status"] == "accepted" and queued["started_at"] is None and queued["ended_at"] is None
             assert queued["accepted_at"] is not None and queued["route"] == "auto-demo"
             statuses.append(queued["status"])
-            # A replayed turn (no admission-time state in this process) is armed by its own preparation.
-            key = session_key("auto-demo-1-100")
-            disable_session_yolo(key)
             authority._schedule = schedule
             for ref in held:
                 schedule(ref)
@@ -100,7 +94,6 @@ async def probe(peer):
             running = await status("auto-demo-1-100")
             assert running["status"] == "running" and running["started_at"] is not None and running["end_reason"] is None
             statuses.append(running["status"])
-            assert is_session_yolo_enabled(key), "a yolo route's turn must never wait on an approval"
             peer.blocked.clear()
             peer.release.set()
             await async_wait_until(lambda: not adapter._background_tasks, timeout=30, what="the delivery to finalize")
@@ -109,7 +102,6 @@ async def probe(peer):
             assert ended["status"] == "ended" and ended["end_reason"] == "completed", ended
             assert ended["ended_at"] is not None
             statuses.append(ended["status"])
-            assert not is_session_yolo_enabled(key), "the close of the session releases the route's bypass"
             assert set(ended) == {"delivery_id", "route", "status", "session_id", "accepted_at", "started_at",
                                   "ended_at", "end_reason"}
             assert "BLOCK_FIFO" not in json.dumps(ended)
@@ -124,15 +116,14 @@ async def probe(peer):
             await async_wait_until(lambda: not adapter._background_tasks, timeout=30, what="the plain delivery")
             assert await status("plain-1") is None and await status("missing") is None
 
-            # Feedback runs in the delivery's own session, behind nothing, under the route's yolo.
+            # Feedback runs in the delivery's own session, behind nothing.
             sid = ended["session_id"]
+            peer.blocked.clear()
             feedback = asyncio.create_task(run_feedback(runner, "auto-demo-1-100", "BLOCK_FIFO make the hero bigger"))
             assert await asyncio.to_thread(peer.blocked.wait, 15)
-            assert is_session_yolo_enabled(key)
             peer.release.set()
             plain = await feedback
             peer.release.clear()
-            assert not is_session_yolo_enabled(key)
             session, messages = await asyncio.to_thread(delivery_transcript, runner, "auto-demo-1-100")
             assert session["id"] == sid and session["ended_at"] is not None
             users = [m["content"] for m in messages if m["role"] == "user"]
@@ -224,51 +215,27 @@ async def probe(peer):
                 "SELECT target_session_id FROM session_admissions WHERE request_id LIKE ?", ("auto-demo-3-300%",))}
             assert targets == {third_sid}, targets
 
-            # A provider retry closes a settled delivery's session before its finalizer does: the bypass
-            # still ends with the session.
-            close_gate = asyncio.Event()
-            adapter._end_webhook_session = held_end
-            await post(client, "auto-demo", "fourth run", "auto-demo-4-400")
-            await async_wait_until(lambda: (delivery_status(runner, "auto-demo-4-400") or {}).get("status") == "ended",
-                                   timeout=30, what="the fourth delivery to settle")
-            fourth_key = session_key("auto-demo-4-400")
-            assert is_session_yolo_enabled(fourth_key)
-            assert await adapter._admit_agent_run(
-                {"text": "fourth run"}, "fourth run", "auto-demo-4-400", time.time(), route_config=adapter._routes["auto-demo"],
-                route_name="auto-demo", profile=None, event_type="unknown") == "duplicate"
-            close_gate.set()
-            adapter._end_webhook_session = real_end
-            await async_wait_until(lambda: not adapter._background_tasks, timeout=30, what="the fourth finalizer")
-            assert authority.db.get_session(delivery_status(runner, "auto-demo-4-400")["session_id"])["ended_at"]
-            assert not is_session_yolo_enabled(fourth_key), "the bypass outlived its closed session"
-
-            # A close's bypass cleanup and a feedback reopen never interleave: feedback waits for the cleanup,
-            # then runs with its own bypass.
-            captured, released, armed = threading.Event(), threading.Event(), {"on": True}
-            real_get = authority.db.get_session
-
-            def held_get(session_id):
-                snapshot = real_get(session_id)
-                if armed["on"] and snapshot and snapshot.get("ended_at") is not None:
-                    armed["on"] = False
-                    captured.set()
-                    assert released.wait(30)
-                return snapshot
-            authority.db.get_session = held_get
-            peer.blocked.clear()
-            await post(client, "auto-demo", "fifth run", "auto-demo-5-500")
-            assert await asyncio.to_thread(captured.wait, 30), "the close never read its session"
-            fifth_key = session_key("auto-demo-5-500")
-            fifth_feedback = asyncio.create_task(run_feedback(runner, "auto-demo-5-500", "BLOCK_FIFO fifth feedback"))
-            await asyncio.sleep(0.3)  # without the shared critical section, feedback is admitted and running here
-            released.set()
-            assert await asyncio.to_thread(peer.blocked.wait, 20)
-            await asyncio.sleep(0.3)
-            assert is_session_yolo_enabled(fifth_key), "a feedback turn lost its bypass to an earlier close"
-            peer.release.set()
-            assert (await fifth_feedback)["status"] == "completed"
-            peer.release.clear()
-            authority.db.get_session = real_get
+            # Route yolo, as behavior: a dangerous (not hardline) command runs in a yolo route's turns, a
+            # replayed turn and a feedback turn included, and waits for an approval nobody gives (denied on
+            # timeout) on any other route. The per-session bypass registry is never touched.
+            home = Path(os.environ["HERMES_HOME"])
+            doomed = {name: home / f"yolo-{name}" for name in ("replayed", "feedback", "plain")}
+            for directory in doomed.values():
+                directory.mkdir()
+            held = []
+            authority._schedule = held.append
+            await post(client, "auto-demo", f"DANGER {doomed['replayed']}", "auto-demo-6-600")
+            authority._schedule = schedule
+            for ref in held:
+                schedule(ref)
+            await async_wait_until(lambda: not doomed["replayed"].exists(), timeout=60,
+                                   what="the yolo route's replayed turn to run its command")
+            assert (await run_feedback(runner, "auto-demo-6-600", f"DANGER {doomed['feedback']}"))["status"] == "completed"
+            assert not doomed["feedback"].exists(), "a feedback turn on a yolo route waited on an approval"
+            await post(client, "plain", f"DANGER {doomed['plain']}", "plain-2")
+            await async_wait_until(lambda: not adapter._background_tasks, timeout=60, what="the plain route's turn")
+            assert doomed["plain"].exists(), "a route without yolo ran a command that needs approval"
+            assert not approval._session_yolo, "route yolo is turn-scoped, never the global bypass"
             for refused, code in (("missing", 404), ("plain-1", 404)):
                 try:
                     await run_feedback(runner, refused, "x")
@@ -288,8 +255,18 @@ def main():
     import threading
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     sys.path.insert(1, str(Path(__file__).parent / "fixtures"))
-    from shared_authority_peer import ModelPeer
-    peer = ThreadingHTTPServer(("127.0.0.1", 0), ModelPeer)
+    from kosmi_peer import ScriptedPeer, newest_user_text, tags_or_ack, text, tool_call
+
+    class DangerPeer(ScriptedPeer):
+        """``DANGER <dir>``: a terminal call deleting it (needs approval, not hardline); then ``TOOL_DONE``."""
+
+        def script(self, request):
+            if request["messages"][-1]["role"] == "tool":
+                return text("TOOL_DONE")
+            target = re.search(r'DANGER (/[^\s"\\]+)', newest_user_text(request))
+            return tool_call("terminal", {"command": f"rm -rf {target.group(1)}"}) if target else tags_or_ack(request)
+
+    peer = ThreadingHTTPServer(("127.0.0.1", 0), DangerPeer)
     peer.requests, peer.metadata_requests = [], []
     peer.blocked, peer.release = threading.Event(), threading.Event()
     threading.Thread(target=peer.serve_forever, daemon=True).start()
@@ -297,7 +274,8 @@ def main():
     os.environ.update(OPENAI_API_KEY="loopback-only", OPENAI_BASE_URL=url)
     Path(os.environ["HERMES_HOME"], "config.yaml").write_text(
         f"model:\n  default: local-wire-stub\n  provider: custom\n  base_url: {url}\n"
-        "streaming:\n  enabled: false\nauxiliary:\n  title_generation:\n    enabled: false\n")
+        "streaming:\n  enabled: false\nauxiliary:\n  title_generation:\n    enabled: false\n"
+        "approvals:\n  timeout: 3\n")
     try:
         asyncio.run(probe(peer))
     finally:

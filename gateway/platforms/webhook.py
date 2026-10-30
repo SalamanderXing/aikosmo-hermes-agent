@@ -983,11 +983,11 @@ class WebhookAdapter(BasePlatformAdapter):
         return route if isinstance(route, dict) else {}
 
     def unattended_yolo(self, source) -> bool:
-        """AI Kosmo per-route ``yolo: true``, asked by the turn's preparation (``_hmwa_prepare_turn``) for
-        every turn of a delivery's session, a replay after a restart included. A webhook route is an
-        unattended lane: a pending approval has no human behind it, times out and auto-denies, which kills
-        the run. The delivery's finalization releases the session's bypass once it closes the session. Session
-        yolo is not a full bypass: the hardline blocklist in tools.approval still applies."""
+        """AI Kosmo per-route ``yolo: true``, asked by the turn runner for every turn of the route (a replay
+        after a restart and operator feedback included). A webhook route is an unattended lane: a pending
+        approval has no human behind it, times out and auto-denies, which kills the run. Such a turn runs
+        with approvals off, bound to the turn itself (``tools.approval_context.unattended_turn``), so nothing
+        outlives it. Not a full bypass: the hardline blocklist in tools.approval still applies."""
         return self._route_for_source(source).get("yolo") is True
 
     async def _finalize_delivery(self, event, authority, receipt):
@@ -1009,26 +1009,8 @@ class WebhookAdapter(BasePlatformAdapter):
         binding = getattr(event, '_webhook_receipt', None)
         if binding is not None:
             authority, receipt = binding
-            # Only a close releases the route's yolo: another turn of this session (operator feedback) still
-            # queued or running keeps the session open, and keeps its bypass.
-            # The bypass is released inside the close's own critical section: a feedback turn reopening the
-            # session afterwards re-arms it for its own turns, never loses it to this cleanup.
             async with self._session_close_lock:
                 finalize_webhook(authority, receipt)
-                await self._release_closed_yolo(event.source, receipt)
-
-    async def _release_closed_yolo(self, source, receipt) -> None:
-        """A yolo route's bypass ends with its session, whichever path closed it (this finalization, a
-        provider retry's); a session another turn keeps open (operator feedback) keeps it."""
-        if not self.unattended_yolo(source):
-            return
-        from gateway.session_authorities import active_authority, authority_for_profile_id
-        runner = self._message_handler.__self__
-        authority = authority_for_profile_id(runner, receipt.ref.profile_id) or active_authority(runner)
-        session = await asyncio.to_thread(authority.db.get_session, receipt.ref.session_id)
-        if session is not None and session.get("ended_at") is not None:
-            from tools.approval import disable_session_yolo
-            disable_session_yolo(runner._session_key_for_source(source))
 
     # --- Signature validation ---
 

@@ -329,69 +329,37 @@ def main():
     import threading
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     sys.path.insert(1, str(Path(__file__).parent / "fixtures"))
-    from shared_authority_peer import ModelPeer
+    from kosmi_peer import ScriptedPeer, newest_user_text, text, tool_call
 
-    class ToolPeer(ModelPeer):
-        """ENV_PROBE: a terminal call printing the caller token; READ_UPLOAD: the attachment reader on the
-        staged @file; after a tool result: ``SAW <result>``. ``hold`` first requests wait for each other."""
+    class ToolPeer(ScriptedPeer):
+        """ENV_PROBE: a terminal call printing a digest of the caller token; READ_UPLOAD: the attachment
+        reader on the staged @file; after a tool result: ``SAW <result>``. ``hold`` first requests wait for
+        each other."""
 
-        def do_POST(self):
-            request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-            if "messages" not in request:
-                return self._reply(request, {"role": "assistant", "content": "ok"})
-            self.server.requests.append(request)
-            last = request["messages"][-1]
-            user = next((m for m in reversed(request["messages"]) if m["role"] == "user"), {})
-            text = json.dumps(user.get("content"))
+        def script(self, request):
+            last, user = request["messages"][-1], newest_user_text(request)
             if last["role"] == "tool":
                 content = last["content"] if isinstance(last["content"], str) else json.dumps(last["content"])
                 try:
                     content = json.loads(content).get("output") or json.loads(content).get("content") or content
                 except (ValueError, AttributeError):
                     pass
-                return self._reply(request, {"role": "assistant", "content": f"SAW {content}"})
-            if "BLOCK_FIFO" in text:
-                self.server.blocked.set()
-                self.server.release.wait(90)
+                return text(f"SAW {content}")
             with self.server.lock:
                 waiting = self.server.arrived < self.server.hold
                 if waiting:
                     self.server.arrived += 1
             while waiting and self.server.arrived < self.server.hold and time.monotonic() < self.server.deadline:
                 time.sleep(0.02)
-            if "ENV_PROBE" in text:
+            if "ENV_PROBE" in user:
                 # A digest, never the token itself: the transcript keeps tool output.
-                call = ("terminal", {"command": 'if [ -n "${KOSMO_CLI_AUTH_ACCESS_TOKEN+x}" ]; then printf "%s" '
-                                                '"$KOSMO_CLI_AUTH_ACCESS_TOKEN" | sha256sum | cut -c1-16; else printf absent; fi'})
-            elif "READ_UPLOAD" in text:
-                path = re.search(r"@file:([^\s\"\\]+)", text).group(1)
-                call = ("cloud_read_attachment", {"path": path})
-            else:
-                return self._reply(request, {"role": "assistant", "content": "LOCAL_ACK"})
-            self._reply(request, {"role": "assistant", "content": None, "tool_calls": [{
-                "id": f"call_{len(self.server.requests)}", "type": "function",
-                "function": {"name": call[0], "arguments": json.dumps(call[1])}}]}, finish="tool_calls")
-
-        def _reply(self, request, message, finish="stop"):
-            base = {"id": "c", "model": "local-wire-stub", "created": 1}
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream" if request.get("stream") else "application/json")
-            self.end_headers()
-            if not request.get("stream"):
-                self.wfile.write(json.dumps({**base, "object": "chat.completion", "choices": [
-                    {"index": 0, "message": message, "finish_reason": finish}],
-                    "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}}).encode())
-                return
-            delta = {"role": "assistant"}
-            if message.get("tool_calls"):
-                delta["tool_calls"] = [{"index": 0, **call} for call in message["tool_calls"]]
-            else:
-                delta["content"] = message["content"]
-            for chunk_delta, chunk_finish in [(delta, None), ({}, finish)]:
-                chunk = {**base, "object": "chat.completion.chunk", "choices": [
-                    {"index": 0, "delta": chunk_delta, "finish_reason": chunk_finish}]}
-                self.wfile.write(("data: " + json.dumps(chunk) + "\n\n").encode())
-            self.wfile.write(b"data: [DONE]\n\n")
+                return tool_call("terminal", {"command": 'if [ -n "${KOSMO_CLI_AUTH_ACCESS_TOKEN+x}" ]; then printf "%s" '
+                                              '"$KOSMO_CLI_AUTH_ACCESS_TOKEN" | sha256sum | cut -c1-16; else printf absent; fi'},
+                                 f"call_{len(self.server.requests)}")
+            if "READ_UPLOAD" in user:
+                path = re.search(r"@file:([^\s\"\\]+)", user).group(1)
+                return tool_call("cloud_read_attachment", {"path": path}, f"call_{len(self.server.requests)}")
+            return text("LOCAL_ACK")
 
     peer = ThreadingHTTPServer(("127.0.0.1", 0), ToolPeer)
     peer.requests, peer.metadata_requests = [], []
