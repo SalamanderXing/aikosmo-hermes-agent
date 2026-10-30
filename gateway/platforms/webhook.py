@@ -1011,9 +1011,11 @@ class WebhookAdapter(BasePlatformAdapter):
             authority, receipt = binding
             # Only a close releases the route's yolo: another turn of this session (operator feedback) still
             # queued or running keeps the session open, and keeps its bypass.
+            # The bypass is released inside the close's own critical section: a feedback turn reopening the
+            # session afterwards re-arms it for its own turns, never loses it to this cleanup.
             async with self._session_close_lock:
                 finalize_webhook(authority, receipt)
-            await self._release_closed_yolo(event.source, receipt)
+                await self._release_closed_yolo(event.source, receipt)
 
     async def _release_closed_yolo(self, source, receipt) -> None:
         """A yolo route's bypass ends with its session, whichever path closed it (this finalization, a
