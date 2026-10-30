@@ -882,6 +882,19 @@ async def _handle_runs(self, request: web.Request, *, _api_server) -> web.Respon
     return _accepted_response(run_id, "started", gateway_session_key, replayed=False)
 
 
+def _run_pending(self, run_id: str) -> bool:
+    """AI Kosmo: whether a run can still execute here: a live task, or a queued or started admission."""
+    if run_id in self._active_run_tasks:
+        return True
+    from gateway.platforms.api_server_authority_runs import run_admission
+    from hermes_state_runtime import RuntimeStoreError
+    try:
+        owned = run_admission(self, run_id)
+    except RuntimeStoreError:
+        return True  # an ambiguous ledger answer keeps the credential; the run decides
+    return owned is not None and owned[1]["status"] in ("queued", "started")
+
+
 def _cloud_request(self, request: web.Request, body: Any, _openai_error):
     """AI Kosmo: ``((runtime, token, hotel slugs), None)`` for a Cloud door, ``(None, None)`` for any
     other run, or ``(None, refusal)``. The caller credential and hotel scope leave every body here,
@@ -1592,6 +1605,8 @@ def _sweep_orphaned_runs_once(self, now: Optional[float] = None) -> None:
             _retire_live_run(self, run_id)
     from gateway.platforms import api_server_text
     api_server_text.sweep(self, now)
+    from gateway import kosmi_cloud
+    kosmi_cloud.sweep(lambda run_id: _run_pending(self, run_id))
     for run_id, status in list(self._run_statuses.items()):
         if (status.get("status") in {"completed", "failed", "cancelled"}
                 and now - float(status.get("updated_at", 0) or 0) > self._RUN_STATUS_TTL):

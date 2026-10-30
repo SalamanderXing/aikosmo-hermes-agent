@@ -154,10 +154,8 @@ async def run_feedback(runner, delivery_id: str, content: Any) -> dict[str, Any]
         event = await asyncio.to_thread(feedback_event, source, row["target_session_id"], delivery_id, content)
     except ValueError as exc:
         raise FeedbackRefused(str(exc).split(":", 1)[-1], 400) from exc
-    # The one-shot session was closed by the delivery's finalization; a closed row would make the routing
-    # store open a fresh conversation instead of continuing this one.
-    await asyncio.to_thread(authority.db.reopen_session, row["target_session_id"])
-    finalized = await adapter.admit_followup(event, dict(envelope["webhook_delivery"]))
+    finalized = await adapter.admit_followup(
+        event, dict(envelope["webhook_delivery"]), lambda: authority.db.reopen_session(row["target_session_id"]))
     if finalized is not None:
         await asyncio.shield(finalized)
     rows = authority.db._read_all("SELECT admission_id FROM session_admissions WHERE request_id=?", (event.message_id,))

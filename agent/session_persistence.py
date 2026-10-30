@@ -145,8 +145,9 @@ def _durable_row_content(agent: Any, role: Any, content: Any) -> Any:
     """``_durable_content`` except API user messages, which keep native image parts so Cloud history and
     resumed API conversations retain the image itself (other platforms and tool results keep the text
     projection)."""
-    if (role == "user" and getattr(agent, "platform", None) == "api_server" and isinstance(content, list)
-            and not _is_multimodal_tool_result(content)):
+    from gateway.kosmi_cloud import CUSTOMER_PLATFORM  # Cloud customer turns are API turns too
+    if (role == "user" and getattr(agent, "platform", None) in ("api_server", CUSTOMER_PLATFORM)
+            and isinstance(content, list) and not _is_multimodal_tool_result(content)):
         return content
     return _durable_content(content)
 

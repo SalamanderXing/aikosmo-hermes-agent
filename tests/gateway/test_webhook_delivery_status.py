@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import time
 
 from gateway.config import PlatformConfig
 from gateway.platforms.api_server import APIServerAdapter
@@ -146,6 +147,36 @@ async def probe(peer):
             request = json.dumps(peer.requests[-1]["messages"])
             assert "use this logo" in request and "@file:" in request and "notes.txt" in request
             assert "image_url" in request or "image" in request
+            # The delivery's own destination still resolves with feedback turns on its chat.
+            from gateway.platforms.webhook_delivery import retained_destination
+            chat = authority.sessions[sid].source.chat_id
+            assert retained_destination(adapter, chat)["deliver"] == "log"
+
+            # Feedback racing the delivery's own close: finalization is released between the reopen and
+            # the admission; the feedback must still land in the delivery's session.
+            gate, real_end = asyncio.Event(), adapter._end_webhook_session
+
+            async def gated_end(event, chat_id):
+                await gate.wait()
+                await real_end(event, chat_id)
+            adapter._end_webhook_session = gated_end
+            await post(client, "auto-demo", "second run", "auto-demo-2-200")
+            await async_wait_until(lambda: (delivery_status(runner, "auto-demo-2-200") or {}).get("status") == "ended",
+                                   timeout=30, what="the second delivery to settle")
+            second_sid = delivery_status(runner, "auto-demo-2-200")["session_id"]
+            real_reopen, loop = authority.db.reopen_session, asyncio.get_running_loop()
+
+            def reopen_then_release_close(session_id):
+                real_reopen(session_id)
+                loop.call_soon_threadsafe(gate.set)
+                time.sleep(0.3)  # without the close lock, finalization closes the session right here
+            authority.db.reopen_session = reopen_then_release_close
+            raced = await run_feedback(runner, "auto-demo-2-200", "race feedback")
+            authority.db.reopen_session, adapter._end_webhook_session = real_reopen, real_end
+            assert raced["status"] == "completed"
+            (row,) = authority.db._read_all("SELECT target_session_id FROM session_admissions WHERE request_id LIKE ?",
+                                            ("auto-demo-2-200:feedback:%",))
+            assert row["target_session_id"] == second_sid, "feedback rotated into a fresh session"
             for refused, code in (("missing", 404), ("plain-1", 404)):
                 try:
                     await run_feedback(runner, refused, "x")

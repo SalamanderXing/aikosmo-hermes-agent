@@ -87,12 +87,16 @@ def retained_destination(adapter, chat_id):
     scoped = active_authority(runner)
     candidates = [scoped] if scoped is not None else serving_authorities(runner)
     # Only the signed ingress admission carries the destination; later automation rows
-    # (process/watch completions) on the same chat share its source but never compete.
+    # (process/watch completions) on the same chat share its source but never compete, and
+    # neither do later turns admitted on the chat (AI Kosmo operator feedback): the delivery's own
+    # admission is the one whose request id is the delivery id its chat id names.
+    from gateway.platforms.webhook import _WebhookDeliveryIdentity
     query = """SELECT payload_json FROM session_admissions
         WHERE json_extract(payload_json, '$.native_text_v1.source.chat_id')=?
           AND json_extract(payload_json, '$.native_text_v1.source.platform')='webhook'
-          AND json_extract(payload_json, '$.native_text_v1.automation') IS NULL"""
-    rows = [row for authority in candidates for row in authority.db._read_all(query, (chat_id,))]
+          AND json_extract(payload_json, '$.native_text_v1.automation') IS NULL AND request_id=?"""
+    own = (chat_id, _WebhookDeliveryIdentity.delivery_from_chat_id(chat_id))
+    rows = [row for authority in candidates for row in authority.db._read_all(query, own)]
     if len(rows) != 1:
         raise RuntimeStoreError('not_found')
     return checked_destination(adapter, chat_id, json.loads(rows[0]['payload_json']))
