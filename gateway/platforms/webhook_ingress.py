@@ -292,7 +292,14 @@ def finalize_webhook(authority, receipt):
     """End only the settled admitted generation, atomically with the epoch fence."""
     if receipt.status != 'terminal' or receipt.execution_generation is None:
         return False
-    return authority_store(authority).runtime.end_after_settlement(
+    store = authority_store(authority)
+    # AI Kosmo: a shared thread session (webhook:<route>:thread-<key>) outlives its turns.
+    from gateway.platforms.webhook_linear import is_thread_chat
+    record = store.admissions.get(admission_id=receipt.admission_id)
+    source = ((record.payload.get('native_text_v1') or {}).get('source') or {}) if record is not None else {}
+    if is_thread_chat(source.get('chat_id') or ''):
+        return False
+    return store.runtime.end_after_settlement(
         authority.epoch, session_id=receipt.ref.session_id, admission_id=receipt.admission_id,
         generation=receipt.execution_generation, admission_epoch=receipt.authority_epoch, reason='webhook_complete')
 
