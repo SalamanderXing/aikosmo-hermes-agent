@@ -8,7 +8,8 @@ admission commits, keyed by the admission's request id (the run id), and :func:`
 around the turn through ContextVars, never ``os.environ``, then drops it. Which runtime the turn gets
 is not secret and is committed with the admission (``settings.cloud_runtime``), so a turn replayed
 after a restart is still a customer turn; it finds no credential and fails closed instead of running
-with the shared operator identity.
+with the shared operator identity, and one that was running when the process died settles interrupted at
+boot (``gateway.session_unattended_unknown``) instead of pausing its conversation.
 """
 from __future__ import annotations
 
@@ -53,6 +54,11 @@ def cloud_runtime(prepared) -> Optional[str]:
     settings = (prepared or {}).get("settings") or {}
     runtime = settings.get("cloud_runtime")
     return runtime if runtime in CLOUD_RUNTIMES else None
+
+
+def is_cloud_admission(payload) -> bool:
+    """Whether a committed API admission is a Cloud turn (its runtime is committed with it)."""
+    return cloud_runtime(payload.get("api_turn_v1")) is not None
 
 
 def customer_turn() -> bool:

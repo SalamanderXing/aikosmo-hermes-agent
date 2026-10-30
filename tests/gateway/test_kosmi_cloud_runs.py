@@ -21,11 +21,23 @@ def test_cloud_runs_identity_customer_runtime_text_and_restart(tmp_path):
     repo = Path(__file__).resolve().parents[2]
     work = tmp_path / "work"
     work.mkdir()
-    env = dict(os.environ, HERMES_HOME=str(tmp_path / "state"), HERMES_CWD=str(work), TERMINAL_CWD=str(work))
-    result = subprocess.run([sys.executable, __file__], cwd=work, env=env, capture_output=True, text=True,
-                            timeout=300, check=False)
+    state = tmp_path / "state"
+    env = dict(os.environ, HERMES_HOME=str(state), HERMES_CWD=str(work), TERMINAL_CWD=str(work))
+    # Phase one serves until it is killed mid-turn (a real restart: the process and its memory die).
+    live = subprocess.Popen([sys.executable, __file__], cwd=work, env={**env, "PROBE_PHASE": "live"},
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    deadline = time.monotonic() + 240
+    while not (state / "phase-live.json").exists():
+        if live.poll() is not None or time.monotonic() > deadline:
+            live.kill()
+            raise AssertionError(live.communicate()[0])
+        time.sleep(0.2)
+    live.kill()
+    live.wait()
+    result = subprocess.run([sys.executable, __file__], cwd=work, env={**env, "PROBE_PHASE": "recover"},
+                            capture_output=True, text=True, timeout=240, check=False)
     assert result.returncode == 0, result.stdout + result.stderr
-    receipt = json.loads((tmp_path / "state" / "cloud-receipt.json").read_text())
+    receipt = json.loads((state / "cloud-receipt.json").read_text())
     assert receipt["env"] == {"alice": digest("alice-token"), "bob": digest("bob-token"), "ordinary": "absent"}
     assert receipt["customer_tools"] == CUSTOMER_TOOLS
     assert receipt["restart"] == {"without_credential": "failed", "with_credential": "completed"}
@@ -52,31 +64,32 @@ def digest(token):
     return hashlib.sha256(token.encode()).hexdigest()[:16]
 
 
-async def probe(peer):
-    import aiohttp
-    from gateway import kosmi_cloud
+async def start_gateway(instance):
     from gateway.config import Platform, PlatformConfig
     from gateway.platforms.api_server import APIServerAdapter
     from gateway.run import GatewayRunner
-    from gateway.session_api_turn import recover_api_turns
     from gateway.session_authority import initialize_session_authority
-    from tests.waiting import async_wait_until
+    runner = GatewayRunner()
+    runner._running = True
+    # On a restart this is boot recovery: lost turns are fenced unknown, unattended ones settle interrupted.
+    authority = await initialize_session_authority(runner, profile_id="default", instance_id=instance)
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={"key": KEY, "port": 0}))
+    adapter.gateway_runner = runner
+    adapter.set_message_handler(runner._handle_message)
+    runner.adapters[Platform.API_SERVER] = adapter
+    assert await adapter.connect()
+    return runner, authority, adapter, f"http://127.0.0.1:{adapter._site._server.sockets[0].getsockname()[1]}"
+
+
+async def probe(peer):
+    if os.environ["PROBE_PHASE"] == "recover":
+        return await recover(peer)
+    import aiohttp
+    from gateway import kosmi_cloud
 
     home = Path(os.environ["HERMES_HOME"])
     os.environ["KOSMO_CLI_AUTH_ACCESS_TOKEN"] = "stale-global-token"  # process env must never be the identity
-
-    async def gateway(instance):
-        runner = GatewayRunner()
-        runner._running = True
-        authority = await initialize_session_authority(runner, profile_id="default", instance_id=instance)
-        adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={"key": KEY, "port": 0}))
-        adapter.gateway_runner = runner
-        adapter.set_message_handler(runner._handle_message)
-        runner.adapters[Platform.API_SERVER] = adapter
-        assert await adapter.connect()
-        return runner, authority, adapter, f"http://127.0.0.1:{adapter._site._server.sockets[0].getsockname()[1]}"
-
-    _runner, authority, adapter, base = await gateway("cloud-1")
+    _runner, authority, _adapter, base = await start_gateway("cloud-1")
     auth = {"Authorization": f"Bearer {KEY}"}
 
     def admissions():
@@ -169,21 +182,56 @@ async def probe(peer):
         assert settings[ids[0]] == "staff" and settings[customer_id] == "customer" and list(settings.values()).count(None) == 1
         assert kosmi_cloud._credentials == {}, "every credential leaves memory once its run ends"
 
+        # Restart while a Cloud turn is running: it can never resume (its credential is gone).
+        running = await start("/v1/runs/cloud", {"session_id": "staff-interrupted", "input": "BLOCK_FIFO long",
+                              "cloud_access_token": "alice-token"})
+        assert await asyncio.to_thread(peer.blocked.wait, 20)
         # Restart: two committed customer turns that never ran; the next process holds no credential.
         authority._schedule = lambda ref: None
         lost = await start("/v1/runs/cloud/customer", {"session_id": "customer-lost", "input": "LOST_TURN",
                            "cloud_access_token": "dave-token", "cloud_restricted_hotel_slugs": ["my-hotel"]})
         kept = await start("/v1/runs/cloud/customer", {"session_id": "customer-kept", "input": "KEPT_TURN",
                            "cloud_access_token": "erin-token", "cloud_restricted_hotel_slugs": ["my-hotel"]})
-    await adapter.disconnect()
-    kosmi_cloud._credentials.clear()  # a new process: nothing in memory survived
-    _runner, authority, adapter, base = await gateway("cloud-2")
+        (home / "phase-live.json").write_text(json.dumps({
+            "env": env, "customer_tools": customer_tools, "running": running, "lost": lost, "kept": kept}))
+        await asyncio.Event().wait()  # killed here, mid-turn
+
+
+async def recover(peer):
+    import aiohttp
+    from gateway import kosmi_cloud
+    from gateway.session_api_turn import recover_api_turns
+    from tests.waiting import async_wait_until
+
+    home = Path(os.environ["HERMES_HOME"])
+    live = json.loads((home / "phase-live.json").read_text())
+    running, lost, kept = live["running"], live["lost"], live["kept"]
+    _runner, authority, adapter, base = await start_gateway("cloud-2")
+    auth = {"Authorization": f"Bearer {KEY}"}
+    assert kosmi_cloud._credentials == {}, "a new process holds no credential"
     # A credential for one of them (as if its caller were still bound): it runs restricted, from the
     # committed runtime, never as staff.
     kosmi_cloud.register(kept, kosmi_cloud.CloudCredential("erin-token", ("my-hotel",), None))
     recover_api_turns(adapter)
+    interrupted = authority.db._read_all("SELECT status, outcome FROM session_admissions WHERE request_id=?", (running,))[0]
+    assert (interrupted["status"], interrupted["outcome"]) == ("terminal", "interrupted"), dict(interrupted)
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60)) as client:
+        # The interrupted conversation is not paused behind its lost turn: the next message runs.
+        async with client.post(base + "/v1/runs/cloud", headers=auth, json={
+                "session_id": "staff-interrupted", "input": "AFTER_RESTART", "cloud_access_token": "alice-token"}) as response:
+            assert response.status == 202, await response.text()
+            after = (await response.json())["run_id"]
+        deadline = time.monotonic() + 60
+        while True:
+            async with client.get(f"{base}/v1/runs/{after}", headers=auth) as response:
+                resumed = await response.json()
+            if resumed.get("status") in ("completed", "failed", "cancelled"):
+                break
+            assert time.monotonic() < deadline, ("the conversation stayed paused behind its lost turn", resumed)
+            await asyncio.sleep(0.05)
+        assert resumed["status"] == "completed", resumed
     def terminal(run_id):
-        rows = authority.db._read_all("SELECT status, outcome FROM session_admissions WHERE request_id=?", (run_id,))
+        rows = authority.db._read_all("SELECT status FROM session_admissions WHERE request_id=?", (run_id,))
         return rows and rows[0]["status"] == "terminal"
     await async_wait_until(lambda: terminal(lost) and terminal(kept), timeout=60, what="the recovered turns")
     outcome = {run_id: authority.db._read_all("SELECT outcome FROM session_admissions WHERE request_id=?", (run_id,))[0]["outcome"]
@@ -199,7 +247,7 @@ async def probe(peer):
             for token in (b"alice-token", b"bob-token", b"carol-token", b"dave-token", b"erin-token"):
                 assert token not in content, (file, token)
     (home / "cloud-receipt.json").write_text(json.dumps({
-        "env": env, "customer_tools": customer_tools,
+        "env": live["env"], "customer_tools": live["customer_tools"],
         "restart": {"without_credential": outcome[lost], "with_credential": outcome[kept]}}))
 
 
@@ -245,6 +293,9 @@ def main():
                 except (ValueError, AttributeError):
                     pass
                 return self._reply(request, {"role": "assistant", "content": f"SAW {content}"})
+            if "BLOCK_FIFO" in text:
+                self.server.blocked.set()
+                self.server.release.wait(90)
             with self.server.lock:
                 waiting = self.server.arrived < self.server.hold
                 if waiting:
