@@ -69,7 +69,8 @@ async def record_final_obligation(adapter: Any, event: Any, session_key: str, te
             platform=str(getattr(source.platform, "value", source.platform)),
             chat_id=source.chat_id, thread_id=getattr(source, "thread_id", None),
             content=text_content,
-            adapter_profile=getattr(delivery_adapter, "_owner_profile", None))
+            adapter_profile=getattr(delivery_adapter, "_owner_profile", None),
+            reply_ref=delivery_adapter.final_reply_ref(source.chat_id, str(getattr(event, "message_id", "") or "")))
         await asyncio.to_thread(mark_attempting, obligation_id)
         return obligation_id
     except Exception:

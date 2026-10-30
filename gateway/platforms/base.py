@@ -2600,6 +2600,12 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
     async def disconnect(self) -> None:
         """Disconnect from the platform."""
 
+    def final_reply_ref(self, chat_id: str, turn_id: str) -> Optional[str]:
+        """AI Kosmo: the id a keyed destination creates this turn's final answer under, recorded with the
+        delivery-ledger obligation so a redelivery resends it under that id (metadata ``reply_ref``).
+        ``None`` (every platform but a keyed webhook destination) keeps the plain redelivery."""
+        return None
+
     @abstractmethod
     async def send(self, chat_id: str, content: str, reply_to: Optional[str] = None,
                    metadata: Optional[dict[str, Any]] = None) -> SendResult:

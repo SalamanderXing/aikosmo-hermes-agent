@@ -119,6 +119,56 @@ async def test_a_gateway_started_answer_keeps_one_comment_id_across_retries(monk
         await adapter.disconnect()
 
 
+@pytest.mark.asyncio
+async def test_a_ledgered_answer_is_redelivered_under_its_own_comment_id(monkeypatch):
+    """A final answer whose send failed sits in the delivery ledger; its redelivery posts the same text
+    under the same comment id (read back first), never a marked copy or nothing at all."""
+    from gateway import delivery_ledger
+    from gateway.platforms import webhook_linear
+    from gateway.platforms.event import MessageEvent
+    from gateway.session_envelope import restore_native
+    runner, authority, adapter, _port, _tiers = await gateway(None, [])
+    authority._schedule = lambda ref: None
+    runner._schedule_flood_redelivery = lambda *a, **kw: None
+    monkeypatch.setenv("LINEAR_API_KEY", "lin_test_key")
+    attempts, outage = [], {"on": True}
+
+    def linear(query, variables, api_key):
+        if "commentCreate" in query:
+            attempts.append(dict(variables["input"]))
+        if outage["on"]:
+            raise TimeoutError("timed out")
+        return {"data": {"comment": None, "commentCreate": {"success": True}}}
+    monkeypatch.setattr(webhook_linear, "_linear_graphql", linear)
+    try:
+        await _admit(adapter, D["1"], "mention")
+        (row,) = authority.db._read_all("SELECT payload_json FROM session_admissions")
+        source = restore_native(json.loads(row["payload_json"]), runner).source
+        session_key = runner._session_key_for_source(source)
+        turn_id = '["plugin","t3-events","k","event-one"]'
+        event = MessageEvent(text="[T3 STATE EVENT] ready", source=source, message_id=turn_id, internal=True)
+        result, _ = await adapter.send_final_ledgered(event, session_key, "T3 final answer", {"notify": True},
+                                                      reply_to=None)
+        assert not result.success and len(attempts) == 1
+        oid = delivery_ledger.compute_obligation_id(session_key, turn_id, "T3 final answer")
+        # What the ledger kept for this answer (a live owner's row: the runtime/boot sweeps claim it the same way).
+        conn = delivery_ledger._connect()
+        try:
+            (stored_ref,) = conn.execute("SELECT reply_ref FROM delivery_obligations WHERE obligation_id=?",
+                                         (oid,)).fetchone()
+        finally:
+            conn.close()
+        assert stored_ref == attempts[0]["id"], "the obligation records the id the answer was attempted under"
+        claimed = [delivery_ledger._claimed_row(oid, session_key, "webhook", source.chat_id, None, "T3 final answer",
+                                                1, "default", needs_marker=True, reply_ref=stored_ref)]
+        outage["on"] = False
+        assert await runner._redeliver_claimed_obligations(claimed) == 1
+        assert len(attempts) == 2 and attempts[1]["id"] == attempts[0]["id"], attempts
+        assert attempts[1]["body"] == "T3 final answer", "a keyed answer is resent unmarked"
+    finally:
+        await adapter.disconnect()
+
+
 async def gateway(peer, posted):
     from gateway.config import Platform, PlatformConfig
     from gateway.platforms.webhook import WebhookAdapter

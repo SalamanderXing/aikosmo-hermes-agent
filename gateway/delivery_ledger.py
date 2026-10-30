@@ -234,14 +234,16 @@ def compute_obligation_id(session_key: str, message_ref: str, content: str) -> s
 
 
 def record_obligation(*, obligation_id: str, session_key: str, platform: str, chat_id: str,
-                      thread_id: Optional[str], content: str, adapter_profile: Optional[str] = None) -> None:
+                      thread_id: Optional[str], content: str, adapter_profile: Optional[str] = None,
+                      reply_ref: Optional[str] = None) -> None:
     """Record a final response as owed to the platform (state='pending'); the store prunes old rows
-    in the same write."""
+    in the same write. ``reply_ref`` (AI Kosmo): the id a keyed destination (a Linear comment) creates this
+    answer under (the adapter's ``final_reply_ref``), so a redelivery converges on one post."""
     pid, started = _owner_stamp()
     with _DB_LOCK, _store() as store:
         store.coordination.record_delivery_obligation(
             obligation_id=obligation_id, session_key=session_key, platform=platform, chat_id=chat_id,
-            thread_id=thread_id, content=content, adapter_profile=adapter_profile,
+            thread_id=thread_id, content=content, adapter_profile=adapter_profile, reply_ref=reply_ref or None,
             owner=OwnerStamp(pid=pid, started_at=started))
 
 
@@ -294,7 +296,8 @@ def _claimed_dict(row: ClaimedObligation) -> dict[str, Any]:
     carried so a runtime claim that is released unsent goes back to ``failed`` with the same error and
     keeps its retry eligibility. An adopted flood row carries ``adopted`` and its ``not_before``."""
     head = {"obligation_id": row.obligation_id, "session_key": row.session_key, "platform": row.platform,
-            "chat_id": row.chat_id, "thread_id": row.thread_id, "content": row.content}
+            "chat_id": row.chat_id, "thread_id": row.thread_id, "content": row.content,
+            **({"reply_ref": row.reply_ref} if row.reply_ref else {})}
     if row.adopted:
         return {**head, "profile": row.profile, "attempts": row.attempts, "adopted": True,
                 "not_before": row.not_before}
