@@ -30,8 +30,11 @@ def is_unattended(row) -> bool:
     # A webhook delivery: the provider already got its 202 and nobody can be asked to resend it.
     # A Kanban card attempt (#134889 KB-8): the dispatcher's marker, committed only by
     # ``SessionAuthority.submit(_kanban_card=...)``; a card row main minted without it still pauses.
+    # AI Kosmo: a Cloud turn can never resume after a restart (its caller credential lived only in that
+    # process, gateway/kosmi_cloud.py) and Cloud offers no Discard, so it settles like an automation turn.
+    from gateway.kosmi_cloud import is_cloud_admission
     return ('local_automation_v1' in payload or 'kanban_card_v1' in payload
-            or 'automation' in native or 'webhook_delivery' in native)
+            or 'automation' in native or 'webhook_delivery' in native or is_cloud_admission(payload))
 
 
 def _unattended_unknown(rows):
