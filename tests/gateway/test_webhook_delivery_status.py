@@ -223,6 +223,24 @@ async def probe(peer):
             targets = {r["target_session_id"] for r in authority.db._read_all(
                 "SELECT target_session_id FROM session_admissions WHERE request_id LIKE ?", ("auto-demo-3-300%",))}
             assert targets == {third_sid}, targets
+
+            # A provider retry closes a settled delivery's session before its finalizer does: the bypass
+            # still ends with the session.
+            close_gate = asyncio.Event()
+            adapter._end_webhook_session = held_end
+            await post(client, "auto-demo", "fourth run", "auto-demo-4-400")
+            await async_wait_until(lambda: (delivery_status(runner, "auto-demo-4-400") or {}).get("status") == "ended",
+                                   timeout=30, what="the fourth delivery to settle")
+            fourth_key = session_key("auto-demo-4-400")
+            assert is_session_yolo_enabled(fourth_key)
+            assert await adapter._admit_agent_run(
+                {"text": "fourth run"}, "fourth run", "auto-demo-4-400", time.time(), route_config=adapter._routes["auto-demo"],
+                route_name="auto-demo", profile=None, event_type="unknown") == "duplicate"
+            close_gate.set()
+            adapter._end_webhook_session = real_end
+            await async_wait_until(lambda: not adapter._background_tasks, timeout=30, what="the fourth finalizer")
+            assert authority.db.get_session(delivery_status(runner, "auto-demo-4-400")["session_id"])["ended_at"]
+            assert not is_session_yolo_enabled(fourth_key), "the bypass outlived its closed session"
             for refused, code in (("missing", 404), ("plain-1", 404)):
                 try:
                     await run_feedback(runner, refused, "x")

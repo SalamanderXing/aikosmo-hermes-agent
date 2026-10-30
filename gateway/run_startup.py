@@ -465,9 +465,15 @@ class GatewayStartupMixin:
             if adapter is None:
                 continue
             content = row["content"]
-            if row.get("needs_marker"):
+            # AI Kosmo: a keyed answer (a Linear comment) is resent as the final it is, under the id it was
+            # first attempted with (recorded at ledgering by the adapter's final_reply_ref). It is one atomic
+            # post the destination reads back by id and body, so it carries no recovery marker.
+            reply_ref = row.get("reply_ref")
+            if row.get("needs_marker") and not reply_ref:
                 content = row.get("marker", RECOVERED_MARKER) + content
             metadata = {"thread_id": row["thread_id"]} if row.get("thread_id") else None
+            if reply_ref:
+                metadata = {**(metadata or {}), "notify": True, "reply_ref": reply_ref}
             try:
                 result = await adapter.send(chat_id=row["chat_id"], content=content, metadata=metadata)
             except Exception as send_err:

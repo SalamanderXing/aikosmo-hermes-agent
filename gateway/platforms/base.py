@@ -2681,6 +2681,12 @@ class BasePlatformAdapter(ABC):
     async def disconnect(self) -> None:
         """Disconnect from the platform."""
 
+    def final_reply_ref(self, chat_id: str, turn_id: str) -> Optional[str]:
+        """AI Kosmo: the id a keyed destination creates this turn's final answer under, recorded with the
+        delivery-ledger obligation so a redelivery resends it under that id (metadata ``reply_ref``).
+        ``None`` (every platform but a keyed webhook destination) keeps the plain redelivery."""
+        return None
+
     @abstractmethod
     async def send(self, chat_id: str, content: str, reply_to: Optional[str] = None,
                    metadata: Optional[dict[str, Any]] = None) -> SendResult:
@@ -4237,7 +4243,8 @@ class BasePlatformAdapter(ABC):
                 platform=str(getattr(source.platform, "value", source.platform)),
                 chat_id=source.chat_id, thread_id=getattr(source, "thread_id", None),
                 content=text_content,
-                adapter_profile=getattr(delivery_adapter, "_owner_profile", None))
+                adapter_profile=getattr(delivery_adapter, "_owner_profile", None),
+                reply_ref=delivery_adapter.final_reply_ref(source.chat_id, str(getattr(event, "message_id", "") or "")))
             await asyncio.to_thread(mark_attempting, obligation_id)
             return obligation_id
         except Exception:

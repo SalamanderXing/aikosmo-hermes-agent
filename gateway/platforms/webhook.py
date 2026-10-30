@@ -359,6 +359,9 @@ class WebhookAdapter(BasePlatformAdapter):
         # interactive exact-match rule would deliver.
         try:
             delivery = turn_destination(self, chat_id)
+            if (metadata or {}).get("reply_ref") and delivery.get("deliver") == "linear_comment":
+                # A delivery-ledger redelivery: the answer's own id, recorded when it was first attempted.
+                delivery = {**delivery, "reply_id": metadata["reply_ref"]}
         except Exception:
             if is_autonomous_silence_response(content):
                 logger.info("[webhook] Response for %s is a silence marker — not delivering", chat_id)
@@ -378,6 +381,16 @@ class WebhookAdapter(BasePlatformAdapter):
             logger.debug("[webhook] Skipping non-final send for %s (notify not set)", chat_id)
             return SendResult(success=True)
         return await self._deliver_to(delivery, chat_id, content)
+
+    def final_reply_ref(self, chat_id: str, turn_id: str) -> Optional[str]:
+        """AI Kosmo: a linear_comment answer's comment id, recorded with its delivery-ledger obligation."""
+        from types import SimpleNamespace
+        try:
+            destination = turn_destination(self, chat_id, SimpleNamespace(message_id=turn_id))
+        except Exception:
+            logger.warning("[webhook] No destination for %s to key its ledgered answer on", chat_id, exc_info=True)
+            return None
+        return destination.get("reply_id") or None
 
     async def send_final_ledgered(self, event: MessageEvent, *args, **kwargs):
         """AI Kosmo: name the replying turn for ``send``, which keys a thread chat's answer on it."""
@@ -999,10 +1012,21 @@ class WebhookAdapter(BasePlatformAdapter):
             # Only a close releases the route's yolo: another turn of this session (operator feedback) still
             # queued or running keeps the session open, and keeps its bypass.
             async with self._session_close_lock:
-                closed = finalize_webhook(authority, receipt)
-            if closed and self.unattended_yolo(event.source):
-                from tools.approval import disable_session_yolo
-                disable_session_yolo(self._message_handler.__self__._session_key_for_source(event.source))
+                finalize_webhook(authority, receipt)
+            await self._release_closed_yolo(event.source, receipt)
+
+    async def _release_closed_yolo(self, source, receipt) -> None:
+        """A yolo route's bypass ends with its session, whichever path closed it (this finalization, a
+        provider retry's); a session another turn keeps open (operator feedback) keeps it."""
+        if not self.unattended_yolo(source):
+            return
+        from gateway.session_authorities import active_authority, authority_for_profile_id
+        runner = self._message_handler.__self__
+        authority = authority_for_profile_id(runner, receipt.ref.profile_id) or active_authority(runner)
+        session = await asyncio.to_thread(authority.db.get_session, receipt.ref.session_id)
+        if session is not None and session.get("ended_at") is not None:
+            from tools.approval import disable_session_yolo
+            disable_session_yolo(runner._session_key_for_source(source))
 
     # --- Signature validation ---
 
