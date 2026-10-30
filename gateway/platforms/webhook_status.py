@@ -161,4 +161,3 @@ async def run_feedback(runner, delivery_id: str, content: Any) -> dict[str, Any]
     rows = authority.db._read_all("SELECT admission_id FROM session_admissions WHERE request_id=?", (event.message_id,))
     settled = get_session_admission(authority.db, admission_id=rows[0]["admission_id"]) if rows else None
     return {"delivery_id": delivery_id, "status": settled["outcome"] if settled else "consumed"}
-
