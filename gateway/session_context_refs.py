@@ -63,9 +63,12 @@ async def turn_references(runner, event, source, session_key, text):
     context, as a typed turn stores it: later turns still read the content. A refused local turn
     leaves its refusal on ``event`` for the prepare step to answer with."""
     from gateway.session_cli_turn import cli_turn, rebind_api_text
+    from gateway.kosmi_cloud import customer_turn
     api_text = cli_turn(event.message_id).get('api_text')
     target = text if api_text is None else api_text
-    if "@" not in target:
+    if "@" not in target or customer_turn():
+        # AI Kosmo: a Cloud customer turn never reads the gateway's workspace; its uploads stay literal
+        # references for cloud_read_attachment, which is bound to this conversation's upload directory.
         return text
     if source.platform == Platform.LOCAL:
         expanded, refusal = await inbound_references(runner, source, session_key, target)

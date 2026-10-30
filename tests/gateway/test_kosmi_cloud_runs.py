@@ -198,6 +198,18 @@ async def probe(peer):
         async with client.delete(f"{base}/api/sessions/kosmi_flow", headers=auth) as response:
             assert response.status == 200, await response.text()
 
+        # `@` references: a staff turn expands a workspace file; a customer turn never reads the workspace.
+        Path("staff-private.txt").write_text("STAFF_PRIVATE_REF_SENTINEL")
+        for lane, path, extra in (("customer", "/v1/runs/cloud/customer", {"cloud_restricted_hotel_slugs": ["my-hotel"]}),
+                                  ("staff", "/v1/runs/cloud", {})):
+            before = len(peer.requests)
+            ref_run = await finish(await start(path, {"session_id": f"refs-{lane}", "cloud_access_token": "alice-token",
+                                                      "input": f"REF_PROBE @file:{Path.cwd() / 'staff-private.txt'}", **extra}))
+            assert ref_run["status"] == "completed", ref_run
+            inlined = "STAFF_PRIVATE_REF_SENTINEL" in json.dumps([r["messages"] for r in peer.requests[before:]])
+            stored = "STAFF_PRIVATE_REF_SENTINEL" in json.dumps(authority.db.get_messages(f"refs-{lane}"))
+            assert (inlined, stored) == ((False, False) if lane == "customer" else (True, True)), (lane, inlined, stored)
+
         # Customer runtime: the effective tools and system prompt the model receives.
         upload = base64.b64encode(b"HTTP_UPLOAD_CONTENT").decode()
         customer_id = await start("/v1/runs/cloud/customer", {
