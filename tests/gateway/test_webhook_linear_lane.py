@@ -13,6 +13,8 @@ import re
 import subprocess
 import sys
 
+import pytest
+
 _SECRET = b"lane-secret"
 ROOT = "c0000000-0000-4000-8000-000000000001"
 ISSUE = "a0000000-0000-4000-8000-0000000000aa"
@@ -42,6 +44,79 @@ def test_linear_lane_through_the_authority_and_a_restart(tmp_path):
     receipt = json.loads((tmp_path / "lane-receipt.json").read_text())
     assert receipt["thread_order"] == [D["1"], D["2"]]
     assert receipt["restart_reply"] == D["6"]
+
+
+def _thread_payload(trigger):
+    return {"issue": ISSUE, "parent": ROOT, "trigger": trigger,
+            "__hermes_toolset_tier__": "staff", "__hermes_session_key__": ROOT}
+
+
+async def _admit(adapter, delivery_id, trigger):
+    return await adapter._admit_agent_run(
+        _thread_payload(trigger), "comment", delivery_id, 0.0, route_config=ROUTE, route_name="linear-comment",
+        profile=None, event_type="Comment")
+
+
+@pytest.mark.asyncio
+async def test_concurrent_thread_deliveries_each_commit_their_own_destination():
+    """Two comments of one thread admitted while a third admission holds the lock: each keeps its trigger
+    (the destination is published and snapshotted inside the same critical section)."""
+    _runner, authority, adapter, _port, _tiers = await gateway(None, [])
+    authority._schedule = lambda ref: None
+    try:
+        await adapter._session_close_lock.acquire()
+        first = asyncio.create_task(_admit(adapter, D["1"], "mention"))
+        await asyncio.sleep(0)
+        second = asyncio.create_task(_admit(adapter, D["2"], "assigned"))
+        await asyncio.sleep(0)
+        adapter._session_close_lock.release()
+        assert await asyncio.gather(first, second) == ["accepted", "accepted"]
+        triggers = {row["request_id"]: json.loads(row["payload_json"])["native_text_v1"]["webhook_delivery"]
+                    ["deliver_extra"]["trigger"]
+                    for row in authority.db._read_all("SELECT request_id, payload_json FROM session_admissions")}
+        assert triggers == {D["1"]: "mention", D["2"]: "assigned"}
+        assert await _admit(adapter, D["1"], "mention") == "duplicate"
+    finally:
+        await adapter.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_gateway_started_answer_keeps_one_comment_id_across_retries(monkeypatch):
+    """A T3 answer whose create commits but whose response and read-back are lost is retried: the retry
+    reuses the comment id, so Linear holds one comment."""
+    from types import SimpleNamespace
+    from gateway.platforms import webhook_linear
+    _runner, authority, adapter, _port, _tiers = await gateway(None, [])
+    authority._schedule = lambda ref: None
+    monkeypatch.setenv("LINEAR_API_KEY", "lin_test_key")
+    posted, lost = [], {"readback": False}
+
+    def linear(query, variables, api_key):
+        if "commentCreate" in query:
+            posted.append(dict(variables["input"]))
+            if len(posted) == 1:
+                lost["readback"] = True
+                raise ConnectionResetError("connection reset by peer")
+            return {"data": {"commentCreate": {"success": True}}}
+        if lost["readback"]:
+            lost["readback"] = False
+            raise ConnectionResetError("connection reset by peer")
+        match = next((c for c in posted if c["id"] == variables["id"]), None)
+        return {"data": {"comment": match and {"id": match["id"], "body": match["body"],
+                                               "parentId": match.get("parentId"), "issue": {"id": match["issueId"]}}}}
+    monkeypatch.setattr(webhook_linear, "_linear_graphql", linear)
+    try:
+        assert await _admit(adapter, D["1"], "mention") == "accepted"
+        token = webhook_linear.replying_turn.set(SimpleNamespace(message_id='["plugin","t3-events","k","x"]'))
+        try:
+            result = await adapter._send_with_retry(f"webhook:linear-comment:thread-{ROOT}", "one T3 answer",
+                                                    metadata={"notify": True}, base_delay=0, max_retries=1)
+        finally:
+            webhook_linear.replying_turn.reset(token)
+        assert result.success
+        assert len({c["id"] for c in posted}) == 1 and re.fullmatch(webhook_linear._UUID4_RE, posted[0]["id"])
+    finally:
+        await adapter.disconnect()
 
 
 async def gateway(peer, posted):
