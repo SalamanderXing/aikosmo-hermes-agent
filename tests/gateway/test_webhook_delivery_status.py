@@ -241,6 +241,34 @@ async def probe(peer):
             await async_wait_until(lambda: not adapter._background_tasks, timeout=30, what="the fourth finalizer")
             assert authority.db.get_session(delivery_status(runner, "auto-demo-4-400")["session_id"])["ended_at"]
             assert not is_session_yolo_enabled(fourth_key), "the bypass outlived its closed session"
+
+            # A close's bypass cleanup and a feedback reopen never interleave: feedback waits for the cleanup,
+            # then runs with its own bypass.
+            captured, released, armed = threading.Event(), threading.Event(), {"on": True}
+            real_get = authority.db.get_session
+
+            def held_get(session_id):
+                snapshot = real_get(session_id)
+                if armed["on"] and snapshot and snapshot.get("ended_at") is not None:
+                    armed["on"] = False
+                    captured.set()
+                    assert released.wait(30)
+                return snapshot
+            authority.db.get_session = held_get
+            peer.blocked.clear()
+            await post(client, "auto-demo", "fifth run", "auto-demo-5-500")
+            assert await asyncio.to_thread(captured.wait, 30), "the close never read its session"
+            fifth_key = session_key("auto-demo-5-500")
+            fifth_feedback = asyncio.create_task(run_feedback(runner, "auto-demo-5-500", "BLOCK_FIFO fifth feedback"))
+            await asyncio.sleep(0.3)  # without the shared critical section, feedback is admitted and running here
+            released.set()
+            assert await asyncio.to_thread(peer.blocked.wait, 20)
+            await asyncio.sleep(0.3)
+            assert is_session_yolo_enabled(fifth_key), "a feedback turn lost its bypass to an earlier close"
+            peer.release.set()
+            assert (await fifth_feedback)["status"] == "completed"
+            peer.release.clear()
+            authority.db.get_session = real_get
             for refused, code in (("missing", 404), ("plain-1", 404)):
                 try:
                     await run_feedback(runner, refused, "x")
