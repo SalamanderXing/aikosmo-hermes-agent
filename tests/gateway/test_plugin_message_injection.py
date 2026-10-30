@@ -483,3 +483,76 @@ async def test_under_a_session_authority_injection_enters_the_durable_fifo(monke
     assert await runner._dispatch_plugin_message_injection(
         session_key=entry.session_key, content="again", plugin_id="notify-plugin") is False
     adapter.handle_message.assert_not_awaited()
+
+@pytest.mark.asyncio
+async def test_dispatch_rejects_changed_owner_before_adapter_acceptance():
+    entry = _entry()
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(entry, adapter)
+    assert not await runner._dispatch_plugin_message_injection(
+        session_key=entry.session_key, content='old T3 result', plugin_id='t3-events',
+        expected_session_id='previous-session',
+    )
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_t3_outbox_returns_to_exact_session_through_real_gateway(tmp_path):
+    t3_events = pytest.importorskip('t3_events')  # the image copies t3ctl's bin/t3-events here
+
+    entry = _entry()
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(entry, adapter)
+    runner._running_agents = {}
+    runner._session_db = SimpleNamespace(
+        get_session=AsyncMock(return_value={'id': entry.session_id, 'ended_at': None}),
+        get_compression_tip=AsyncMock(return_value=entry.session_id),
+    )
+    path = tmp_path / 'events.sqlite'
+    receipt = {'threadId': 't3-test', 'dispatchId': 'dispatch-test', 'messageId': 'message-test', 'previousTurnId': 'old', 'turnId': 'new'}
+    assert t3_events.register(receipt, {
+        'T3CTL_EVENTS_ENABLED': '1',
+        'HERMES_SESSION_ID': entry.session_id,
+        'HERMES_SESSION_KEY': entry.session_key,
+        'HERMES_SESSION_PLATFORM': 'telegram',
+    }, path)
+    with t3_events.connect(path) as db:
+        subscription = dict(db.execute('SELECT * FROM subscriptions').fetchone())
+    t3_events.observe(subscription, {'reason': 'settled', 'turn': 'completed', 'turnId': 'new',
+                                    'lastAssistant': 'Changed artifact and validation evidence'}, path)
+    await t3_events.deliver_pending(runner, path)
+    await t3_events.deliver_pending(runner, path)
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.call_args.args[0]
+    assert event.source.chat_id == entry.origin.chat_id
+    assert event.metadata['gateway_session_id'] == entry.session_id
+    assert event.metadata['gateway_session_strict'] is True
+    assert event.internal is True
+    assert event.allow_gateway_control is False
+    assert 'Changed artifact and validation evidence' in event.text
+    assert t3_events.pending(path) == []
+
+
+@pytest.mark.asyncio
+async def test_t3_storage_outage_exhausts_native_supervision_without_stopping_gateway(monkeypatch):
+    t3_events = pytest.importorskip('t3_events')  # the image copies t3ctl's bin/t3-events here
+
+    runner = _runner(_entry(), SimpleNamespace(handle_message=AsyncMock()))
+    exhausted = asyncio.Event()
+    calls = []
+    def unavailable():
+        calls.append(1)
+        raise OSError('outbox storage unavailable')
+    monkeypatch.setattr(t3_events, 'poll', unavailable)
+    monkeypatch.setattr(runner, '_supervised_backoff', lambda attempt: 0)
+    runner._spawn_supervised(lambda: t3_events.watch_gateway(runner, interval=0.05), 't3_event_watcher',
+                             on_give_up=lambda name: exhausted.set())
+    try:
+        await asyncio.wait_for(exhausted.wait(), timeout=3)
+    finally:
+        stayed_running = runner._running
+        runner._running = False
+        await asyncio.sleep(0.06)
+    assert len(calls) == runner._MAX_SUPERVISED_RESTARTS + 1
+    assert stayed_running is True
+    assert not runner._background_tasks

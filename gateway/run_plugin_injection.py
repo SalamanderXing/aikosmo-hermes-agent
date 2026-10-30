@@ -187,12 +187,16 @@ class GatewayPluginInjectionMixin:
 
     async def _dispatch_plugin_message_injection(
         self, *, session_key: str, content: str, plugin_id: str, plugin_home: Optional[Path] = None,
+        expected_session_id: Optional[str] = None,
     ) -> bool:
-        """Route a plugin-triggered turn through the session's live adapter."""
+        """Route a plugin-triggered turn through the session's live adapter. ``expected_session_id``
+        (AI Kosmo t3-events): refuse when the key now names another session (a reset since)."""
         if not self._plugin_injection_accepting():
             return False
         entry = await self.async_session_store.lookup_by_session_key(session_key)
         if entry is None or entry.origin is None or not self._plugin_injection_accepting():
+            return False
+        if expected_session_id is not None and entry.session_id != expected_session_id:
             return False
 
         from gateway.session_identity import replace_source

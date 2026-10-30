@@ -1603,6 +1603,11 @@ class GatewayStartupMixin:
         self._spawn_reconnect_watcher()
         for method in self._POST_RECONNECT_WATCHERS:
             self._spawn_supervised(getattr(self, method), method[1:])
+        if os.environ.get("T3CTL_EVENTS_ENABLED") == "1" and os.environ.get("HERMES_T3_ENABLED") == "true":
+            # AI Kosmo: T3 state events return to the session that started the task. The image copies
+            # t3ctl's bin/t3-events beside the gateway as t3_events.py.
+            from t3_events import watch_gateway as watch_t3_events
+            self._spawn_supervised(lambda: watch_t3_events(self), "t3_event_watcher")
         from gateway.runtime_downgrade_exit import runtime_downgrade_watcher
         self._spawn_supervised(lambda: runtime_downgrade_watcher(self), "runtime_downgrade_watcher")
         # Scale-to-zero watcher ONLY when opted in, messaging is relay-only/absent, and a wakeUrl exists.
