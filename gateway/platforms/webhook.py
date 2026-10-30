@@ -820,8 +820,11 @@ class WebhookAdapter(BasePlatformAdapter):
         self._delivery_info_order.append((now, session_chat_id))
         self._prune_delivery_info(now)
         source = self._admission_source(route_name, profile, delivery_id)
+        # reply_expected=False: an autonomous lane has no human waiting on this turn, so a bare silence marker
+        # stays silent instead of being replaced by the gateway's "unexpected silence" notice (run_turn's
+        # silence_allowed). A lane that owes a reply anyway must say so itself.
         event = MessageEvent(text=prompt, message_type=MessageType.TEXT, source=source, raw_message=payload,
-                             message_id=delivery_id, timestamp=datetime.fromtimestamp(0, UTC))
+                             message_id=delivery_id, timestamp=datetime.fromtimestamp(0, UTC), reply_expected=False)
         from gateway.platforms.webhook_ingress import admit_producer
         try:
             receipt = await admit_producer(self, event)
