@@ -641,9 +641,11 @@ def _clear_turn_process_ownership(agent: Any) -> None:
 
 
 def session_attachment_directory(session_id: str) -> Path:
-    """Where one session's uploaded documents are staged."""
+    """Where one session's uploaded documents are staged: on the persistent home, not the gateway's
+    replaceable working directory."""
+    from hermes_constants import get_hermes_home
     safe_session_id = re.sub(r"[^a-zA-Z0-9._-]", "-", session_id)[:128] or "session"
-    return Path.cwd() / ".hermes" / "api-attachments" / safe_session_id
+    return get_hermes_home() / "api-attachments" / safe_session_id
 
 
 def decode_data_url(data_url: Any) -> tuple[str, bytes]:
@@ -696,8 +698,8 @@ def _stage_session_file_parts(content: Any, session_id: str) -> Any:
         filename, safe_name, file_bytes = next(staged)
         path = attachment_dir / f"{uuid.uuid4().hex[:10]}-{safe_name}"
         path.write_bytes(file_bytes)
-        relative_path = path.relative_to(Path.cwd())
-        normalized.append({"type": "input_text", "text": f"[Attached file: {safe_name}]\n@file:{relative_path}"})
+        # Absolute: tools read it from their own working directory, which may differ from the gateway's.
+        normalized.append({"type": "input_text", "text": f"[Attached file: {safe_name}]\n@file:{path}"})
     return normalized
 
 
@@ -4517,6 +4519,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     _handle_steer_run = _run_route_delegate("_handle_steer_run")
     _handle_resolve_unknown_run = _run_route_delegate("_handle_resolve_unknown_run")
     _handle_stop_run = _run_route_delegate("_handle_stop_run")
+
+    async def _handle_run_text(self, request: web.Request) -> web.StreamResponse:
+        from gateway.platforms.api_server_text import handle_run_text
+        return await handle_run_text(self, request)
 
     async def _sweep_orphaned_runs(self) -> None:
         return await _api_runs._sweep_orphaned_runs(self)

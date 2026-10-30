@@ -158,19 +158,25 @@ class GatewaySessionAgentMixin:
         from gateway.session_policy import policy_for_source
         from gateway.session_worker_construct import session_prefill
         policy = policy_for_source(runner, src)
-        return ctx.AIAgent(
+        from gateway.kosmi_cloud import CUSTOMER_PLATFORM, check_customer_agent, customer_turn
+        customer = customer_turn()
+        if customer:
+            # AI Kosmo customer runtime: no staff SOUL, project context, memory, profile, prefill or
+            # background learning; importing the tool module registers the caller-bound toolset.
+            from tools import kosmo_cloud_tool
+        agent = ctx.AIAgent(
             model=turn_route["model"], **turn_route["runtime"], **_checkpoint_agent_kwargs(ctx.user_config),
             max_iterations=max_iterations, quiet_mode=not bool(policy and policy.verbose), verbose_logging=False,
             enabled_toolsets=ctx.enabled_toolsets, disabled_toolsets=ctx.disabled_toolsets,
             ephemeral_system_prompt=combined_ephemeral or None,
-            prefill_messages=(session_prefill(active_authority(runner), policy, src.chat_id) if policy
-                              else runner._prefill_messages) or None,
+            prefill_messages=None if customer else (session_prefill(active_authority(runner), policy, src.chat_id)
+                                                    if policy else runner._prefill_messages) or None,
             reasoning_config=reasoning_config, service_tier=runner._service_tier,
             request_overrides=turn_route.get("request_overrides"),
             providers_allowed=pr.get("only"), providers_ignored=pr.get("ignore"), providers_order=pr.get("order"),
             provider_sort=pr.get("sort"), provider_require_parameters=pr.get("require_parameters", False),
             provider_data_collection=pr.get("data_collection"),
-            session_id=ctx.session_id, platform=platform_key,
+            session_id=ctx.session_id, platform=CUSTOMER_PLATFORM if customer else platform_key,
             user_id=src.user_id, user_id_alt=src.user_id_alt, user_name=src.user_name,
             chat_id=src.chat_id, chat_name=src.chat_name, chat_type=src.chat_type, thread_id=src.thread_id,
             gateway_session_key=ctx.session_key,
@@ -178,15 +184,19 @@ class GatewaySessionAgentMixin:
             # Reload from disk — do not reuse the startup snapshot.
             # See #60955.
             fallback_model=None if api_runtime_locked() else self._runner._refresh_fallback_model(),
-            skip_context_files=skip_context_files,
+            skip_context_files=skip_context_files or customer,
             # Keep the persona even with minimal context: soul identity is one small file.
-            load_soul_identity=not bool(policy and policy.ignore_rules),
-            skip_memory=bool(policy and policy.ignore_rules),
+            load_soul_identity=not bool(policy and policy.ignore_rules) and not customer,
+            skip_memory=bool(policy and policy.ignore_rules) or customer,
+            skip_background_review=customer,
             pass_session_id=bool(policy and policy.pass_session_id),
             # A local session's frozen budget (`--run-budget` / its profile's agent.run_budget_seconds);
             # None leaves the agent reading the owner's config, as before.
             run_budget_seconds=policy.run_budget_seconds if policy else None,
         )
+        if customer:
+            check_customer_agent(agent)
+        return agent
 
     def _resolve_turn_agent(self, turn_route, platform_key, combined_ephemeral, max_iterations, reasoning_config, pr):
         """Reuse this session's cached AIAgent (frozen system prompt + tool schemas → prompt cache

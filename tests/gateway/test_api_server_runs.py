@@ -287,7 +287,9 @@ class TestStartRun:
                 message = agent.run_conversation.call_args.kwargs["user_message"]
                 assert any(part.get("type") == "image_url" for part in message)
                 assert "@file:" in str(message)
-                files = list((tmp_path / ".hermes/api-attachments/upload-smoke").glob("*"))
+                from hermes_constants import get_hermes_home
+                # Staged on the persistent home, not the gateway's replaceable working directory.
+                files = list((get_hermes_home() / "api-attachments" / "upload-smoke").glob("*"))
                 assert len(files) == 1
                 assert files[0].read_text() == "hello"
 

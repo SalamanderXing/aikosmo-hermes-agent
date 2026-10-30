@@ -115,6 +115,8 @@ def _frozen_plugin_prompt_sections(agent: Any) -> tuple:
     A restored ``_cached_system_prompt`` is parsed instead of re-running plugin
     code; a render that raises at a rebuild boundary keeps the previous bytes
     (stashed by ``invalidate_system_prompt``) instead of silently vanishing."""
+    if agent.platform == "cloud_customer":
+        return ()
     if hasattr(agent, "_plugin_system_prompt_sections_snapshot"):
         return agent._plugin_system_prompt_sections_snapshot
     stored_prompt = getattr(agent, "_cached_system_prompt", None)
@@ -676,7 +678,7 @@ def _coding_parts(agent: Any) -> tuple[list[str], list[str], list[str]]:
     """
     try:
         from agent.coding_context import coding_system_prompt_parts
-        if not agent.valid_tool_names:
+        if not agent.valid_tool_names or agent.platform == "cloud_customer":
             return [], [], []
         cwd = resolve_context_cwd()
         cwd_key = _workspace_pin_key()
@@ -700,7 +702,7 @@ def _post_workspace_parts(agent: Any) -> list[str]:
     (config.yaml agent.environment_probe; one line, nothing when clean, skipped
     for remote backends), bot-mode protocol, platform hint."""
     parts: list[str] = []
-    if getattr(agent, "_environment_probe", True):
+    if agent.platform != "cloud_customer" and getattr(agent, "_environment_probe", True):
         try:
             from tools.env_probe import get_environment_probe_line
             parts.append(get_environment_probe_line())

@@ -291,7 +291,11 @@ async def execute_admission(authority, ref, row):
                     event.text = '\n'.join(part['text'] for part in prepared['content'] if part.get('type') == 'text')
                 event.allow_gateway_control = False
                 event.internal = True  # trust comes from the private binding and preclaim, never client JSON
-            response = await authority.runner._handle_message(event)
+            # AI Kosmo: a Cloud turn runs with its caller's credential, bound only here; without one in
+            # this process (replayed after a restart) it is refused, never run as the operator.
+            from gateway.kosmi_cloud import cloud_turn
+            with cloud_turn(row, api_execution.get()) as refusal:
+                response = refusal if refusal is not None else await authority.runner._handle_message(event)
             result = captured.get('terminal_result', captured.get('result'))
             if result is None:
                 # No TurnRunner result means the handler answered without executing the turn.

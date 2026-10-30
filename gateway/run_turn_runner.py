@@ -1236,6 +1236,12 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         if room is not None:
             max_iterations = room.max_iterations
             ctx.enabled_toolsets = list(room.enabled_toolsets)
+        from gateway.kosmi_cloud import CUSTOMER_MAX_ITERATIONS, CUSTOMER_TOOLSET, customer_turn
+        if customer_turn():
+            # AI Kosmo customer runtime: an allowlist independent of the staff config, set before the
+            # agent-cache signature so a staff agent is never reused for it.
+            max_iterations = CUSTOMER_MAX_ITERATIONS
+            ctx.enabled_toolsets, ctx.disabled_toolsets = [CUSTOMER_TOOLSET], None
         try:
             model, runtime_kwargs = runner._resolve_session_agent_runtime(
                 source=ctx.source, session_key=ctx.session_key, user_config=ctx.user_config,

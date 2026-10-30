@@ -25,6 +25,7 @@ except ImportError:
     RequestKey = None  # type: ignore[assignment,misc]
 
 from gateway.platforms.api_server_room_grants import _json_error, _room_grant_error_response
+from gateway.platforms.api_server_text import RunText
 from gateway.platforms.api_server_run_idempotency import TERMINAL_STATUSES
 
 
@@ -236,11 +237,16 @@ def _initialize_run_state(self, *, store_factory) -> None:
         self._run_owners, self._run_streams, self._run_streams_created, self._active_run_agents,
         self._active_run_tasks, self._run_statuses, self._run_approval_sessions,
     ) = ({} for _ in range(7))
+    # AI Kosmo: run id -> its public reply snapshot (gateway/platforms/api_server_text.py).
+    self._run_text_streams: dict[str, Any] = {}
 
 
 def _http_routes(self) -> list[tuple[str, str, Any]]:
     return [
         ("POST", "/v1/runs", self._handle_runs), ("GET", "/v1/runs/{run_id}", self._handle_get_run),
+        # AI Kosmo Cloud doors (gateway/kosmi_cloud.py) and the public reply snapshot stream.
+        ("POST", "/v1/runs/cloud", self._handle_runs), ("POST", "/v1/runs/cloud/customer", self._handle_runs),
+        ("GET", "/v1/runs/{run_id}/text", self._handle_run_text),
         ("GET", "/v1/runs/{run_id}/events", self._handle_run_events),
         ("POST", "/v1/runs/{run_id}/approval", self._handle_run_approval),
         ("POST", "/v1/runs/{run_id}/clarify", self._handle_run_clarify),
@@ -728,6 +734,9 @@ async def _handle_runs(self, request: web.Request, *, _api_server) -> web.Respon
         body = await request.json()
     except Exception:
         return _json_error(_openai_error, "Invalid JSON", status=400)
+    cloud, cloud_error = _cloud_request(self, request, body, _openai_error)
+    if cloud_error is not None:
+        return cloud_error
     body, room_error = await self._normalize_room_dispatch(request, body)
     if room_error is not None:
         return room_error
@@ -829,6 +838,7 @@ async def _handle_runs(self, request: web.Request, *, _api_server) -> web.Respon
         agent_kwargs=dict(
             ephemeral_system_prompt=instructions, session_id=session_id, gateway_session_key=gateway_session_key,
             route=route, room_dispatch=room_dispatch, room_execution_policy=room_execution_policy,
+            **({"cloud_runtime": cloud[0]} if cloud else {}),
             **{k: agent_overrides.get(k) for k in ("requested_model", "requested_provider", "model_options")}),
         request_profile=_api_server._api_request_profile.get(),
         browser_control_principal=_api_server._api_request_browser_control_principal.get(),
@@ -839,14 +849,26 @@ async def _handle_runs(self, request: web.Request, *, _api_server) -> web.Respon
     # receipt drives this run's status, so `peer run` keeps its run_id and `peer status` still works.
     # Under session authority the same call admits the turn to the Bot Chat's own FIFO, which is
     # why it is decided BEFORE ``admit_api_turn`` would bind the chat as an API conversation.
-    admitted = await self._admit_to_live_bot_chat(session_id, user_message, turn_author) if selected_session_id else None
+    # A Cloud turn is bound to this process's caller credential and runtime: a live owner elsewhere would
+    # run it without either, so it never hands off.
+    admitted = (await self._admit_to_live_bot_chat(session_id, user_message, turn_author)
+                if selected_session_id and not cloud else None)
     _retarget_to_delivered_chat(self, launch, admitted)
     if admitted is None and getattr(self.gateway_runner, 'session_authority', None) is not None:
+        from gateway import kosmi_cloud
+        if cloud:
+            # Before the commit: a drain already running this session may claim the row at once.
+            runtime, token, slugs = cloud
+            kosmi_cloud.register(run_id, kosmi_cloud.CloudCredential(token, slugs, str(
+                _api_server.session_attachment_directory(str(session_id))) if runtime == "customer" else None))
         refused = await _admit_run_to_authority(
             self, launch, run_id, session_history_delivery, _declared_selected,
             idempotency_scope, idempotency_key, _openai_error)
         if refused is not None:
+            kosmi_cloud.discard(run_id)
             return refused
+    if admitted is None:
+        self._run_text_streams[run_id] = RunText()
     self._activate_admitted_request()
     if admitted is not None:
         task = self._active_run_tasks[run_id] = asyncio.create_task(
@@ -858,6 +880,31 @@ async def _handle_runs(self, request: web.Request, *, _api_server) -> web.Respon
     if hasattr(task, "add_done_callback"):
         task.add_done_callback(self._background_tasks.discard)
     return _accepted_response(run_id, "started", gateway_session_key, replayed=False)
+
+
+def _cloud_request(self, request: web.Request, body: Any, _openai_error):
+    """AI Kosmo: ``((runtime, token, hotel slugs), None)`` for a Cloud door, ``(None, None)`` for any
+    other run, or ``(None, refusal)``. The caller credential and hotel scope leave every body here,
+    before anything normalizes or retains it, and never enter model input or run metadata."""
+    token = body.pop("cloud_access_token", None) if isinstance(body, dict) else None
+    slugs = body.pop("cloud_restricted_hotel_slugs", None) if isinstance(body, dict) else None
+    path = request.path
+    runtime = "customer" if path.endswith("/v1/runs/cloud/customer") else "staff" if path.endswith("/v1/runs/cloud") else None
+    if runtime is None:
+        return None, None
+    if not isinstance(token, str) or not token.strip():
+        return None, _json_error(_openai_error, "Cloud access token required", status=401)
+    if runtime == "customer":
+        # The backend sends the account's properties; the customer's kosmo-cli session is pinned to them.
+        if not isinstance(slugs, list) or not slugs or not all(isinstance(s, str) and s.strip() for s in slugs):
+            return None, _json_error(_openai_error, "Customer hotel scope required", status=400)
+        slugs = tuple(dict.fromkeys(s.strip() for s in slugs))
+    else:
+        slugs = None
+    if getattr(self.gateway_runner, "session_authority", None) is None:
+        # Only the authority's executor binds the caller credential; nothing runs without it.
+        return None, _json_error(_openai_error, "Cloud runs are unavailable", status=503)
+    return (runtime, token, slugs), None
 
 
 def _retarget_to_delivered_chat(self, launch: _RunLaunch, admitted) -> None:
@@ -1031,7 +1078,11 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
     run_id, loop = run.run_id, asyncio.get_running_loop()
     _run_started_at = time.perf_counter()
 
+    text_state = self._run_text_streams.get(run_id)
+
     def _text_cb(delta: Optional[str]) -> None:
+        if text_state is not None:
+            loop.call_soon_threadsafe(text_state.delta, delta)
         if delta is None or run_id not in self._run_streams:
             return
         with suppress(Exception):
@@ -1082,6 +1133,8 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
 
             def _tool_start(call_id, name, args):
                 from agent.display import build_tool_preview
+                if text_state is not None:
+                    loop.call_soon_threadsafe(text_state.tool_started)
                 tool_cb("tool.started", name, build_tool_preview(name, args or {}) or "", args, tool_call_id=call_id)
 
             def _tool_complete(call_id, name, args, result):
@@ -1148,6 +1201,11 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
         # On cancellation (/stop) the executor thread may still block on an approval
         # Event; unregistering releases it. Idempotent on normal completion.
         _unregister_approval_notify(run.approval_session_key)
+        from gateway import kosmi_cloud
+        kosmi_cloud.discard(run_id)  # the turn's own scope already dropped it unless it never ran here
+        if text_state is not None:
+            await asyncio.sleep(0)  # deltas the worker scheduled before returning land first
+            text_state.finish(self._run_statuses.get(run_id, {}).get("status", "failed"), self._RUN_STREAM_TTL)
         with suppress(Exception):
             loop.call_soon(run.put_event, None)  # close after the queued events
         _retire_live_run(self, run_id)
@@ -1165,7 +1223,7 @@ def _release_run_owner_if_forgotten(self, run_id: str) -> None:
     """Drop the owner stamp only once nothing keyed by *run_id* survives: ownership must
     outlive every surface it protects (retired on different clocks); ownerless = fail-closed."""
     live = (self._run_statuses, self._active_run_agents, self._active_run_tasks, self._run_streams,
-            self._run_approval_sessions)
+            self._run_approval_sessions, self._run_text_streams)
     if not any(run_id in table for table in live):
         self._run_owners.pop(run_id, None)
 
@@ -1532,6 +1590,8 @@ def _sweep_orphaned_runs_once(self, now: Optional[float] = None) -> None:
         if task is None or task.done():
             _unregister_approval_notify(self._run_approval_sessions.get(run_id))
             _retire_live_run(self, run_id)
+    from gateway.platforms import api_server_text
+    api_server_text.sweep(self, now)
     for run_id, status in list(self._run_statuses.items()):
         if (status.get("status") in {"completed", "failed", "cancelled"}
                 and now - float(status.get("updated_at", 0) or 0) > self._RUN_STATUS_TTL):

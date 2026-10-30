@@ -247,9 +247,14 @@ def _inject_session_context_env(env: dict) -> None:
     context is engaged ContextVars are authoritative — a bound value (incl. "") wins
     and an _UNSET var is STRIPPED, not inherited. An unengaged CLI keeps the mirror."""
     try:
-        from gateway.session_context import _UNSET, _VAR_MAP, session_context_engaged
+        from gateway.session_context import _UNSET, _VAR_MAP, kosmo_cli_access_token, session_context_engaged
     except Exception:
         return
+    cli_token = kosmo_cli_access_token.get()
+    if cli_token is None:
+        env.pop("KOSMO_CLI_AUTH_ACCESS_TOKEN", None)
+    else:
+        env["KOSMO_CLI_AUTH_ACCESS_TOKEN"] = cli_token
     _engaged = session_context_engaged()
     for var_name, var in _VAR_MAP.items():
         value = var.get()
