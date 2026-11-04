@@ -710,10 +710,20 @@ class GatewayAdapterLifecycleMixin:
     async def _platform_reconnect_watcher(self) -> None:
         """Periodically retry failed platforms: backoff 30s → 300s cap, retryable failures retry
         forever (self-heal), non-retryable drop out. Pausing is manual only (``/platform pause``)."""
+        def _superseded() -> bool:
+            """AI Kosmo: True once another live watcher holds ``_reconnect_watcher_task``. A supervised
+            respawn already scheduled when ``_ensure_reconnect_watcher_running`` started a replacement
+            still spawns, and ``on_spawn`` points the handle at the newest one: every other watcher
+            returns cleanly (never respawned) instead of reconnecting the same platforms in parallel."""
+            owner = getattr(self, "_reconnect_watcher_task", None)
+            return (isinstance(owner, asyncio.Task) and owner is not asyncio.current_task()
+                    and not owner.done())
+
         async def _idle(seconds: int, until_queued: bool = False) -> bool:
-            """Sleep in 1s steps; False once the runner stops (or, if asked, once work is queued)."""
+            """Sleep in 1s steps; False once the runner stops or this watcher is superseded (or, if
+            asked, once work is queued)."""
             for _ in range(seconds):
-                if not self._running:
+                if not self._running or _superseded():
                     return False
                 if until_queued and self._failed_platforms:
                     break
@@ -721,14 +731,14 @@ class GatewayAdapterLifecycleMixin:
             return True
 
         await asyncio.sleep(10)  # initial delay — let startup finish
-        while self._running:
+        while self._running and not _superseded():
             if not self._failed_platforms:
                 if not await _idle(30, until_queued=True):
                     return
                 continue
             now = time.monotonic()
             for platform in list(self._failed_platforms.keys()):
-                if not self._running:
+                if not self._running or _superseded():
                     return
                 await self._reconnect_failed_platform(platform, now)
             if not await _idle(10):  # re-check every 10 seconds
@@ -848,7 +858,9 @@ class GatewayAdapterLifecycleMixin:
                 # then dispose on the KeyError below, leaving inbound on an unregistered adapter.
                 logger.warning("Reconnect %s: superseded by a concurrent reconnect, discarding", platform.value)
                 await _dispose_unused_adapter(adapter)
-                hand_over_held_inbound(adapter, self.adapters.get(platform))
+                # The winner may have failed again since: then its successor entry's predecessor owns inbound.
+                hand_over_held_inbound(adapter, self.adapters.get(platform) or (
+                    self._failed_platforms.get(platform) or {}).get("predecessor"))
             elif success:
                 await self._install_reconnected_adapter(platform, adapter)
             elif adapter.has_fatal_error and not adapter.fatal_error_retryable:
