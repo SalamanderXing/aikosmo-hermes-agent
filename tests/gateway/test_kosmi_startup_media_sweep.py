@@ -185,3 +185,35 @@ async def test_a_profile_served_later_counts_its_sweep_as_owner_work(api, owner,
     assert len(mutation_tasks(owner)) == 1
     release.set()
     await join_authority_work(owner, 5)
+
+
+@pytest.mark.asyncio
+async def test_a_worker_that_fails_after_a_cancel_still_reports_the_cancellation(owner, caplog):
+    from gateway.session_runtime_workers import track_worker_thread
+    release = threading.Event()
+
+    def work():
+        assert release.wait(5)
+        raise ValueError('late failure')
+
+    task = track_worker_thread(owner, work)
+    await asyncio.sleep(0.05)
+    task.cancel()
+    await asyncio.sleep(0.05)
+    assert not task.done()
+    release.set()
+    await asyncio.gather(task, return_exceptions=True)
+    assert task.cancelled() and mutation_tasks(owner) == []
+    assert 'failed after its task was cancelled' in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_a_worker_failure_without_a_cancel_is_the_task_result(owner):
+    from gateway.session_runtime_workers import track_worker_thread
+
+    def work():
+        raise ValueError('plain failure')
+
+    task = track_worker_thread(owner, work)
+    with pytest.raises(ValueError, match='plain failure'):
+        await task

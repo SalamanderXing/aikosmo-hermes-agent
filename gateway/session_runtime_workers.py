@@ -1,7 +1,10 @@
 """Physical worker liveness and cooperative Stop across every served authority."""
 import asyncio
+import logging
 
 from gateway.session_authorities import all_authorities
+
+logger = logging.getLogger(__name__)
 
 
 def executing_sessions(authority):
@@ -82,17 +85,19 @@ def track_worker_thread(authority, work):
     async def run():
         future = asyncio.ensure_future(asyncio.to_thread(work))
         cancelled = False
-        while True:
+        while not future.done():
             try:
-                result = await asyncio.shield(future)
-                break
+                await asyncio.shield(future)
             except asyncio.CancelledError:
-                if future.done():
-                    raise
                 cancelled = True
+            except Exception:
+                pass  # the work's own failure, read from the future below
         if cancelled:
+            if not future.cancelled() and future.exception() is not None:
+                logger.warning('Owner worker thread failed after its task was cancelled',
+                               exc_info=future.exception())
             raise asyncio.CancelledError
-        return result
+        return future.result()
     return track_mutation(authority, run())
 
 
