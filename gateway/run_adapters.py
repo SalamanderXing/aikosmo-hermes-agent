@@ -802,7 +802,21 @@ class GatewayAdapterLifecycleMixin:
         )
 
     async def _reconnect_failed_platform(self, platform, now: float) -> None:
-        """One watcher pass for a queued platform: gate, attempt, and record the outcome."""
+        """One watcher pass for a queued platform: gate, attempt, and record the outcome.
+
+        AI Kosmo: at most one attempt per platform at a time. A superseded watcher only notices it
+        was replaced after its in-flight connect returns, so a second watcher skips a platform whose
+        attempt is still running instead of connecting another adapter beside it."""
+        in_flight = self.__dict__.setdefault("_reconnects_in_flight", set())
+        if platform in in_flight:
+            return
+        in_flight.add(platform)
+        try:
+            await self._reconnect_failed_platform_once(platform, now)
+        finally:
+            in_flight.discard(platform)
+
+    async def _reconnect_failed_platform_once(self, platform, now: float) -> None:
         from gateway.run import _dispose_unused_adapter, _platform_has_bot_credential
         info = self._failed_platforms.get(platform)
         # None: removed concurrently since the caller's snapshot. Paused needs /platform resume.

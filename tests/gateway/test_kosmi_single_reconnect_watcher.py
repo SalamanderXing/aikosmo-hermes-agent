@@ -238,3 +238,76 @@ class TestSupersededReconnectKeepsHeldInbound:
 
         assert runner.adapters[platform] is replacement
         assert [c.args[0] for c in replacement.handle_message.await_args_list] == [held]
+
+
+class TestOneReconnectAttemptPerPlatform:
+    @pytest.mark.asyncio
+    async def test_a_respawned_watcher_does_not_connect_beside_an_in_flight_attempt(self, monkeypatch):
+        """The superseded watcher is still inside connect() when the respawn takes the handle: the
+        respawn must skip the platform rather than connect a second adapter in parallel."""
+        runner = _make_runner()
+        runner._background_tasks = set()
+        runner._reconnect_watcher_task = None
+        runner._update_platform_runtime_status = MagicMock()
+        runner._wire_adapter_handlers = MagicMock()
+        runner._flag_reconnect_needs_attention = MagicMock()
+        runner._run_in_executor_with_context = AsyncMock()
+        runner._create_adapter = lambda *_: StubAdapter()
+        runner._failed_platforms[Platform.TELEGRAM] = {
+            "config": runner.config.platforms[Platform.TELEGRAM], "attempts": 0, "next_retry": 0,
+        }
+        entered_backoff, release_backoff = asyncio.Event(), asyncio.Event()
+        first_connect, finish_connect = asyncio.Event(), asyncio.Event()
+        callers = []
+        real_sleep = asyncio.sleep
+
+        async def _sleep(delay):
+            if delay == 919:
+                entered_backoff.set()
+                await release_backoff.wait()
+            else:
+                await real_sleep(0)
+
+        async def _connect(*args, **kwargs):
+            callers.append(asyncio.current_task())
+            first_connect.set()
+            await finish_connect.wait()
+            return False
+
+        runner._connect_adapter_with_timeout = _connect
+        monkeypatch.setattr(asyncio, "sleep", _sleep)
+        runner._supervised_backoff = lambda _attempt: 919
+        crashed = []
+
+        async def _watcher():
+            if not crashed:
+                crashed.append(True)
+                raise RuntimeError("first watcher crashed")
+            await GatewayRunner._platform_reconnect_watcher(runner)
+
+        runner._platform_reconnect_watcher = _watcher
+
+        async def _spin(n=200):
+            for _ in range(n):
+                await real_sleep(0)
+
+        try:
+            runner._spawn_reconnect_watcher()
+            await asyncio.wait_for(entered_backoff.wait(), 5)
+            runner._ensure_reconnect_watcher_running()
+            replacement = runner._reconnect_watcher_task
+            await asyncio.wait_for(first_connect.wait(), 5)
+            release_backoff.set()
+            await _spin()
+            assert runner._reconnect_watcher_task is not replacement
+
+            assert callers == [replacement]
+            finish_connect.set()
+            await _spin()
+            assert replacement.done() and replacement.exception() is None
+        finally:
+            runner._running = False
+            tasks = list(runner._background_tasks)
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
