@@ -842,7 +842,14 @@ class GatewayAdapterLifecycleMixin:
             self._wire_adapter_handlers(adapter)
             # is_reconnect keeps the server-side update queue so offline-period messages are delivered.
             success = await self._connect_adapter_with_timeout(adapter, platform, is_reconnect=True)
-            if success:
+            if success and self._failed_platforms.get(platform) is not info:
+                # AI Kosmo: a concurrent reconnect already installed this platform (or it was dropped)
+                # while this one connected. Publishing it would replace the live adapter with one we
+                # then dispose on the KeyError below, leaving inbound on an unregistered adapter.
+                logger.warning("Reconnect %s: superseded by a concurrent reconnect, discarding", platform.value)
+                await _dispose_unused_adapter(adapter)
+                hand_over_held_inbound(adapter, self.adapters.get(platform))
+            elif success:
                 await self._install_reconnected_adapter(platform, adapter)
             elif adapter.has_fatal_error and not adapter.fatal_error_retryable:
                 self._mark_platform_fatal(platform.value, adapter)

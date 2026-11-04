@@ -1606,7 +1606,12 @@ class GatewayStartupMixin:
             )
         # Supervised: an escaping exception is restarted with backoff instead of stranding queued
         # platforms (the ensure hook only runs on a NEW fatal). ``on_spawn`` keeps the handle current.
-        self._spawn_reconnect_watcher()
+        # AI Kosmo: a fatal that lands while startup is still running (a slow startup step starves the
+        # Discord heartbeat) already spawned one through _ensure_reconnect_watcher_running. A second
+        # watcher reconnects the same platform in parallel and leaves the live adapter unregistered.
+        _watcher = getattr(self, "_reconnect_watcher_task", None)
+        if _watcher is None or _watcher.done():
+            self._spawn_reconnect_watcher()
         for method in self._POST_RECONNECT_WATCHERS:
             self._spawn_supervised(getattr(self, method), method[1:])
         if os.environ.get("T3CTL_EVENTS_ENABLED") == "1" and os.environ.get("HERMES_T3_ENABLED") == "true":
