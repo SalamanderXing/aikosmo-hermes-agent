@@ -314,24 +314,47 @@ def owns_api_run(adapter, run_id, owner_scope):
     return _valid_owner_scope(stored) and hmac.compare_digest(stored, owner_scope)
 
 
-def recover_api_turns(adapter):
+def recover_api_turns(adapter, *, sweep_media=True):
     """Recover committed work only after the real API adapter is published. A parked profile's
-    retained (retiring) authority is not served: its store is never read here."""
+    retained (retiring) authority is not served: its store is never read here.
+
+    ``sweep_media=False`` leaves the media pass to the caller (``sweep_api_media``): the gateway
+    runs it off the loop."""
     from gateway.session_authorities import owner_scope, serving_authorities
     for authority in serving_authorities(adapter.gateway_runner):
         # Startup is unscoped (the launch profile's home): each profile's media root, config and
         # API bindings must pair with its own state.db, never the launch profile's.
         with owner_scope(authority):
-            recover_authority_api_turns(adapter, authority)
+            recover_authority_api_turns(adapter, authority, sweep_media=sweep_media)
 
 
-def recover_authority_api_turns(adapter, authority):
-    from hermes_state_runtime import list_session_admissions
+def sweep_api_media(authorities):
+    """Startup media pass over *authorities*: collect API images nothing holds any more and compact
+    settled payloads a crash left uncompacted. Synchronous and slow on a large store (the orphan
+    check reads the transcript), so the gateway runs it in a worker thread, never on the loop. One
+    store's failure never stops the others: what is left is collected on the next pass."""
+    from gateway.session_authorities import owner_scope
+    for authority in authorities:
+        try:
+            with owner_scope(authority):
+                _sweep_authority_api_media(authority)
+        except Exception:
+            import logging
+            logging.getLogger(__name__).exception('Startup API media sweep failed for %s', authority.db.db_path)
+
+
+def _sweep_authority_api_media(authority):
     from gateway.session_ingress_media import collect_unheld_api_images
-    import logging
-    collect_unheld_api_images(authority.db)
     from gateway.session_api_media import compact_settled_api_payloads
+    collect_unheld_api_images(authority.db)
     compact_settled_api_payloads(authority.db)
+
+
+def recover_authority_api_turns(adapter, authority, *, sweep_media=True):
+    from hermes_state_runtime import list_session_admissions
+    import logging
+    if sweep_media:
+        _sweep_authority_api_media(authority)
     with authority.db._read_ctx() as conn:
         targets = [row[0] for row in conn.execute(
             "SELECT DISTINCT target_session_id FROM session_admissions WHERE principal_id='api' AND status='queued'")]

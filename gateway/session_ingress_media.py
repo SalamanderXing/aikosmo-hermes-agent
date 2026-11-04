@@ -526,12 +526,21 @@ def _history_mentions(conn, references, after_id=0):
         for tail in (reference['sha256'] + sep + Path(raw).name for sep in ('/', '\\')):
             needles[tail] = needles[json.dumps(tail)[1:-1]] = raw
     prefixes = sorted({reference['sha256'] for reference in references})
+    # Every needle ends in a candidate's file name (raw or JSON-escaped), so a row that names any
+    # candidate contains the names' common prefix (``api_`` for retained API images). Testing that
+    # one literal first spares the per-digest ``instr`` on nearly every row: on a 297k-row, 847 MB
+    # transcript with 48 candidates the pass went from 60 s to 7 s (Kosmi, 2026-11-04).
+    names = [spelling for reference in references
+             for spelling in (Path(reference['path']).name, json.dumps(Path(reference['path']).name)[1:-1])]
+    common = os.path.commonprefix(names)
     # The digests are ONE bound JSON array, never one ``instr`` term each: the statement's size
     # must not grow with the candidate count (SQLite's expression-depth limit fails at ~1000 terms).
     query = ('WITH digests(value) AS MATERIALIZED (SELECT value FROM json_each(?)) SELECT content FROM messages '
-             'WHERE EXISTS (SELECT 1 FROM digests WHERE instr(content, digests.value))' + (' AND id>?' if after_id else ''))
+             'WHERE ' + ('instr(content, ?) AND ' if common else '')
+             + 'EXISTS (SELECT 1 FROM digests WHERE instr(content, digests.value))' + (' AND id>?' if after_id else ''))
+    params = (json.dumps(prefixes), *((common,) if common else ()), *((after_id,) if after_id else ()))
     mentioned = set()
-    for (content,) in conn.execute(query, (json.dumps(prefixes), *((after_id,) if after_id else ()))):
+    for (content,) in conn.execute(query, params):
         text = content.decode('utf-8', 'replace') if isinstance(content, bytes) else str(content)
         mentioned.update(raw for needle, raw in needles.items() if needle in text)
     return mentioned

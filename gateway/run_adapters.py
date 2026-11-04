@@ -924,9 +924,26 @@ class GatewayAdapterLifecycleMixin:
         self.adapters[platform] = adapter
         if platform == Platform.API_SERVER:
             from gateway.session_api_turn import recover_api_turns
-            recover_api_turns(adapter)
+            recover_api_turns(adapter, sweep_media=False)
+            self._schedule_api_media_sweep(adapter)
         self._sync_voice_mode_state_to_adapter(adapter)
         self._bind_voice_input_callback(adapter)
+
+    def _schedule_api_media_sweep(self, adapter) -> None:
+        """Run the startup API media pass in a worker thread. Its orphan-image check reads every
+        transcript row: 60-80 s on a 2.8 GB store (Kosmi, 2026-11-04), during which a pass on the
+        loop starved Discord's heartbeat and the gateway's liveness probes. Without a running loop
+        (a bare test runner) it runs inline."""
+        from gateway.session_api_turn import sweep_api_media
+        from gateway.session_authorities import serving_authorities
+        authorities = list(serving_authorities(adapter.gateway_runner))
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            sweep_api_media(authorities)
+            return
+        task = self._retain_background_task(loop.create_task(asyncio.to_thread(sweep_api_media, authorities)))
+        task.add_done_callback(self._late_failure_callback("startup API media sweep failed"))
 
     def _schedule_planned_restart_replay(self) -> None:
         """Replay the owed planned-restart notice after a reconnect, in the background: notification delivery
