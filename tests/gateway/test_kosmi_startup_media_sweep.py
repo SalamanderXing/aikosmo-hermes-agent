@@ -14,6 +14,7 @@ from gateway.config import Platform
 from gateway.run import GatewayRunner
 from gateway.session_api_turn import admit_api_turn
 from gateway.session_ingress_media import _history_mentions, _media_root, collect_unheld_api_images
+from gateway.session_runtime_workers import join_authority_work, mutation_tasks
 
 
 def _plant(*digests, name=None):
@@ -32,6 +33,29 @@ def _note(owner, session_id, content):
     if owner.db.get_session(session_id) is None:
         owner.db.create_session(session_id, source='cli')
     owner.db.append_message(session_id, 'user', content)
+
+
+async def _settled(owner):
+    await asyncio.gather(*list(getattr(owner, '_mutation_tasks', ())), return_exceptions=True)
+
+
+def _blocked_collect(monkeypatch):
+    release, swept = threading.Event(), []
+
+    def slow_collect(db):
+        swept.append(threading.get_ident())
+        assert release.wait(5)
+
+    monkeypatch.setattr('gateway.session_ingress_media.collect_unheld_api_images', slow_collect)
+    return release, swept
+
+
+async def _until(predicate):
+    for _ in range(500):
+        if predicate():
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError('condition never held')
 
 
 def _host():
@@ -75,31 +99,41 @@ async def test_publishing_the_api_adapter_sweeps_media_off_the_loop(api, owner, 
                    user_message='pending', conversation_history=[])
     scheduled = []
     monkeypatch.setattr(owner, '_schedule', lambda ref: scheduled.append(ref.session_id))
-    release, swept = threading.Event(), []
-
-    def slow_collect(db):
-        swept.append(threading.get_ident())
-        assert release.wait(5)
-
-    monkeypatch.setattr('gateway.session_ingress_media.collect_unheld_api_images', slow_collect)
+    release, swept = _blocked_collect(monkeypatch)
     host = _host()
     host._publish_primary_adapter(Platform.API_SERVER, api)
     assert host.adapters[Platform.API_SERVER] is api
     assert scheduled == ['queued']  # recovery never waits for the media pass
-    while not swept:  # the loop runs while the worker holds the pass
-        await asyncio.sleep(0.01)
+    await _until(lambda: swept)  # the loop runs while the worker holds the pass
     release.set()
-    await asyncio.gather(*host._background_tasks)
+    await _settled(owner)
     assert swept == [swept[0]] and swept[0] != threading.get_ident()
+
+
+@pytest.mark.asyncio
+async def test_retirement_and_shutdown_count_the_sweep_until_its_thread_returns(api, owner, monkeypatch):
+    """The pass is the store's owner work: retirement cannot release ownership and shutdown cannot
+    close the store while its thread may still write, even after its task was cancelled."""
+    release, swept = _blocked_collect(monkeypatch)
+    _host()._publish_primary_adapter(Platform.API_SERVER, api)
+    await _until(lambda: swept)
+    (task,) = mutation_tasks(owner)
+    with pytest.raises(TimeoutError):
+        await join_authority_work(owner, 0.1)
+    task.cancel()
+    await asyncio.sleep(0.05)
+    assert not task.done() and mutation_tasks(owner) == [task]  # still counted: the thread is live
+    release.set()
+    await join_authority_work(owner, 5)
+    assert task.cancelled() and mutation_tasks(owner) == []
 
 
 @pytest.mark.asyncio
 async def test_the_background_sweep_still_collects_orphans(api, owner):
     (kept, kept_path), (_orphan, orphan_path) = _plant('d' * 64, 'e' * 64)
     _note(owner, 'keeper', f'{kept}/{kept_path.name}')
-    host = _host()
-    host._publish_primary_adapter(Platform.API_SERVER, api)
-    await asyncio.gather(*host._background_tasks)
+    _host()._publish_primary_adapter(Platform.API_SERVER, api)
+    await _settled(owner)
     assert kept_path.exists() and not orphan_path.exists()
 
 
@@ -111,7 +145,7 @@ async def test_a_failed_background_sweep_is_logged_and_leaves_the_gateway_up(api
     monkeypatch.setattr('gateway.session_api_media.compact_settled_api_payloads', broken)
     host = _host()
     host._publish_primary_adapter(Platform.API_SERVER, api)
-    await asyncio.gather(*host._background_tasks)
+    await _settled(owner)
     assert host.adapters[Platform.API_SERVER] is api
     assert 'Startup API media sweep failed' in caplog.text
 
@@ -134,3 +168,20 @@ async def test_a_profile_served_later_sweeps_in_a_worker_then_recovers(api, owne
     await run_runtime._recover_published_api_turns(runner, owner)
     assert [step for step, _ in order] == ['sweep', 'recover']
     assert order[0][1] != threading.get_ident() and order[1][1] is False
+
+
+@pytest.mark.asyncio
+async def test_a_profile_served_later_counts_its_sweep_as_owner_work(api, owner, monkeypatch):
+    from gateway import run_runtime
+    release, swept = _blocked_collect(monkeypatch)
+    monkeypatch.setattr('gateway.session_api_turn.recover_authority_api_turns',
+                        lambda adapter, authority, sweep_media=True: None)
+    serve = asyncio.ensure_future(run_runtime._recover_published_api_turns(
+        SimpleNamespace(adapters={Platform.API_SERVER: api}), owner))
+    await _until(lambda: swept)
+    assert len(mutation_tasks(owner)) == 1
+    serve.cancel()  # a cancelled serve leaves the pass counted for its retirement
+    await asyncio.sleep(0.05)
+    assert len(mutation_tasks(owner)) == 1
+    release.set()
+    await join_authority_work(owner, 5)
