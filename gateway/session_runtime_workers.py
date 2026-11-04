@@ -74,6 +74,28 @@ def track_mutation(authority, operation):
     return task
 
 
+def track_worker_thread(authority, work):
+    """Run synchronous *work* in a worker thread as owner work of *authority* until the THREAD
+    returns: retirement joins it and shutdown counts it (and so leaves the store open while it
+    runs). A thread cannot be cancelled, so a cancelled task would stop counting a live writer;
+    this one outlives cancellation until the thread is done, then reports the cancellation."""
+    async def run():
+        future = asyncio.ensure_future(asyncio.to_thread(work))
+        cancelled = False
+        while True:
+            try:
+                result = await asyncio.shield(future)
+                break
+            except asyncio.CancelledError:
+                if future.done():
+                    raise
+                cancelled = True
+        if cancelled:
+            raise asyncio.CancelledError
+        return result
+    return track_mutation(authority, run())
+
+
 async def tracked_write(authority, write, then=None, *, ordered=False, after=None):
     """Run a synchronous ledger write (``write()``) in a worker thread, off the owner loop.
 

@@ -433,13 +433,16 @@ def _drop_retired_local_adapter(authority):
 async def _recover_published_api_turns(runner, authority):
     """Boot recovers queued API turns when the launch API adapter is published
     (``recover_api_turns``); a profile served after that runs the same pass on its own store, its
-    media pass in a worker thread (it reads the whole transcript). Called inside the profile's
-    ``owner_scope``; ``to_thread`` carries that scope into the worker."""
+    media pass in a worker thread (it reads the whole transcript), tracked as the profile's owner
+    work. Called inside the profile's ``owner_scope``; ``to_thread`` carries that scope into the
+    worker."""
     from gateway.config import Platform
     api = (getattr(runner, 'adapters', None) or {}).get(Platform.API_SERVER)
     if api is not None:
+        from functools import partial
         from gateway.session_api_turn import recover_authority_api_turns, sweep_api_media
-        await asyncio.to_thread(sweep_api_media, [authority])
+        from gateway.session_runtime_workers import track_worker_thread
+        await asyncio.shield(track_worker_thread(authority, partial(sweep_api_media, [authority])))
         recover_authority_api_turns(api, authority, sweep_media=False)
 
 
