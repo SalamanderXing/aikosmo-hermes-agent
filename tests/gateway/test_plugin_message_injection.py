@@ -470,6 +470,9 @@ async def test_under_a_session_authority_injection_enters_the_durable_fifo(monke
     runner = _runner(entry, adapter)
     authority = SimpleNamespace(admit_automation=AsyncMock())
     monkeypatch.setattr(authorities, "active_authority", lambda _runner: authority)
+    # The route's committed human source (a real authority's ledger: test_kosmi_t3_events_committed_source).
+    monkeypatch.setattr(runner, "_plugin_committed_route_source",
+                        lambda _authority, routed, plugin_id: routed.origin)
 
     assert await runner._dispatch_plugin_message_injection(
         session_key=entry.session_key, content="check the deployment", plugin_id="notify-plugin") is True

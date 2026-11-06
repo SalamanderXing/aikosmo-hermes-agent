@@ -214,6 +214,17 @@ class GatewayPluginInjectionMixin:
             return False
 
         async with self._plugin_injection_scope(source):
+            from gateway.session_authorities import active_authority
+            authority = active_authority(self)
+            if authority is not None:
+                # AI Kosmo: the authority admits the turn only as the route's committed human source.
+                source = self._plugin_committed_route_source(authority, entry, plugin_id=plugin_id)
+                if source is None or not self._plugin_injection_authorized(
+                        source, plugin_id=plugin_id, target=f"session={session_key}"):
+                    return False
+                adapter = self._delivery_adapter_for(source)
+                if adapter is None:
+                    return False
             admitted = await self._admit_plugin_injection(
                 adapter, source, session_key=session_key, session_id=entry.session_id,
                 content=content, plugin_id=plugin_id)
@@ -233,6 +244,31 @@ class GatewayPluginInjectionMixin:
             plugin_id, session_key, entry.session_id,
         )
         return True
+
+    def _plugin_committed_route_source(self, authority, entry, *, plugin_id: str) -> Optional[SessionSource]:
+        """AI Kosmo: the source a keyed plugin turn is admitted as under a session authority, or
+        ``None`` (logged). ``snapshot_automation`` borrows the route's last committed human envelope
+        and refuses (``admission_conflict``) any event whose source differs from it, ``message_id``
+        aside. ``entry.origin`` drifts from that envelope on a live Discord thread: the auto-thread
+        markers, the thread's renamed title, and the member who spoke last are all different, so a
+        T3 completion dispatched from the stored origin is never admitted. Dispatch as the committed
+        source instead, as ``admit_route_wake`` does."""
+        from gateway.session_automation import committed_route_envelope
+        from gateway.session_envelope import restore_native
+        from hermes_state_runtime import RuntimeStoreError
+        target = f"session={entry.session_key}"
+        envelope = committed_route_envelope(authority, entry)
+        if envelope is None:
+            logger.warning("Plugin message injection refused: plugin=%s %s has no human message admitted yet",
+                           plugin_id, target)
+            return None
+        try:
+            return restore_native({'text': '', 'native_text_v1': {
+                key: value for key, value in envelope.items() if key != 'media'}}, self).source
+        except RuntimeStoreError as exc:
+            logger.warning("Plugin message injection refused: plugin=%s %s committed source did not restore (%s)",
+                           plugin_id, target, exc.reason)
+            return None
 
     async def _dispatch_plugin_local_injection(self, source: SessionSource, entry, *, content: str,
                                                plugin_id: str, plugin_home: Optional[Path]) -> bool:
