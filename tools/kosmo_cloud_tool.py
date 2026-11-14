@@ -159,7 +159,19 @@ _KOSMO_CLI_PASSTHROUGH_ENV = (
     "KOSMO_CLI_INTERNAL_API_BASE_URL",
     "KOSMO_CLI_STAFF_API_BASE_URL",
 )
+# Flags whose value kosmo-cli reads (or, for -o, writes) as a local file.
 _PATH_FLAGS = {"--content-file", "--value-file", "--answer-file", "--question-file", "--upload", "-o", "--output"}
+_OUTPUT_FLAGS = {"-o", "--output"}
+# Flags whose value is free text, a page URL or a site path, never a local file: `--new "/rooms ..."` or
+# `--include /apartments/` must not be mistaken for a file reference.
+_TEXT_FLAGS = {
+    "--old", "--new", "--description", "-q", "--question", "-a", "--answer", "--summary", "--quote",
+    "--subject", "--details", "--contains", "--message-search", "--search", "--url", "--include", "--exclude",
+}
+# Commands whose fifth word is a page of the hotel's own website (`/apartments/` or a full URL), resolved by
+# the backend against the hotel's site: `hotel <slug> website read <url-or-path>`,
+# `hotel <slug> sources refresh <url-or-path>`.
+_WEBSITE_PAGE_COMMANDS = {("website", "read"), ("sources", "refresh")}
 _JWT_LIKE = re.compile(r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}")
 
 
@@ -167,24 +179,39 @@ def _kosmo_cli_repo() -> str:
     return os.environ.get("HERMES_CWD") or os.environ.get("KOSMO_CLI_REPO", "/data/repo")
 
 
+def _split_inline_flag(token: str) -> list[str]:
+    """`--content-file=/x` is `--content-file /x` to the CLI's parsers, so the guard reads it the same way."""
+    if token.startswith("-") and "=" in token and re.match(r"^--?[A-Za-z]", token):
+        return token.split("=", 1)
+    return [token]
+
+
 def _kosmo_cli_reject_paths(argv: list[str], attachment_root: str | None) -> str | None:
     """Only this conversation's uploads may be referenced as local files."""
     allowed_root = Path(attachment_root).resolve() if attachment_root else None
-    for index, token in enumerate(argv):
-        previous = argv[index - 1] if index > 0 else ""
-        looks_like_path = token.startswith(("/", "./", "../", "~")) or previous in _PATH_FLAGS
-        if not looks_like_path:
-            continue
-        if previous in {"-o", "--output"}:
+    tokens = [part for token in argv for part in _split_inline_flag(token)]
+    website_page = 4 if tokens[:1] == ["hotel"] and tuple(tokens[2:4]) in _WEBSITE_PAGE_COMMANDS else None
+    for index, token in enumerate(tokens):
+        previous = tokens[index - 1] if index > 0 else ""
+        if previous in _OUTPUT_FLAGS:
             return "Saving to files is not available in this conversation."
-        candidate = Path(token).expanduser()
+        if previous in _PATH_FLAGS:
+            # `--upload <field>=<source>`: only an attached image; a URL stays refused (the backend would fetch it).
+            candidate = token.split("=", 1)[1] if previous == "--upload" and "=" in token else token
+        elif previous in _TEXT_FLAGS or index == website_page:
+            continue
+        elif token.startswith(("/", "./", "../", "~")):
+            candidate = token
+        else:
+            continue
+        path = Path(candidate).expanduser()
         try:
-            resolved = candidate.resolve()
+            resolved = path.resolve()
         except (OSError, RuntimeError):
             return "That file is not an attachment in this conversation."
         if (
             allowed_root is None
-            or candidate.is_symlink()
+            or path.is_symlink()
             or resolved.parent != allowed_root
             or not resolved.is_file()
         ):
@@ -238,7 +265,9 @@ def kosmo_cli(args, **kwargs):
     with tempfile.TemporaryDirectory(prefix="kosmi-customer-cli-") as home:
         try:
             completed = subprocess.run(
-                ["bun", "kosmo-cli", *argv],
+                # --silent: bun echoes the script's command line (every argument, multi-line values
+                # included) to stderr, which reached the customer's output after the CLI's own answer.
+                ["bun", "run", "--silent", "kosmo-cli", *argv],
                 cwd=repo,
                 env=_kosmo_cli_env(token, slugs, home),
                 capture_output=True,
