@@ -164,6 +164,8 @@ _PATH_FLAGS = {
     "--content-file", "--value-file", "--answer-file", "--question-file", "--request-file", "--upload", "-o", "--output",
 }
 _OUTPUT_FLAGS = {"-o", "--output"}
+# Search snapshots: files named by the value under the CLI's home, a staff debugging aid.
+_SNAPSHOT_FLAGS = {"--save", "--diff"}
 # Flags whose value is free text, a page URL or a site path, never a local file: `--new "/rooms ..."` or
 # `--include /apartments/` must not be mistaken for a file reference.
 _TEXT_FLAGS = {
@@ -209,6 +211,8 @@ def _kosmo_cli_reject_paths(argv: list[str], attachment_root: str | None, cwd: s
         previous = tokens[index - 1] if index > 0 else ""
         if previous in _OUTPUT_FLAGS:
             return "Saving to files is not available in this conversation."
+        if token in _SNAPSHOT_FLAGS and previous not in _TEXT_FLAGS:
+            return "Search snapshots are not available in this conversation."
         if previous in _PATH_FLAGS:
             # `--upload <field>=<source>`: only an attached image; a URL stays refused (the backend would fetch it).
             candidate = token.split("=", 1)[1] if previous == "--upload" and "=" in token else token
