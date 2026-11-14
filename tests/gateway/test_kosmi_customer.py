@@ -149,7 +149,7 @@ def test_kosmo_cli_tool_runs_customer_profile_with_scoped_env(tmp_path, monkeypa
     assert "[redacted]" in result["output"] and "eyJabcdefghijklmnop" not in result["output"]
     assert "i18next" not in result["output"]
     argv, kwargs = calls[0]
-    assert argv == ["bun", "kosmo-cli", "hotel", "my-hotel", "kosmo-web"]
+    assert argv == ["bun", "run", "--silent", "kosmo-cli", "hotel", "my-hotel", "kosmo-web"]
     assert kwargs["cwd"] == str(tmp_path)
     assert kwargs["stdin"] is not None
     env = kwargs["env"]
@@ -202,6 +202,13 @@ def test_kosmo_cli_tool_only_accepts_this_conversations_uploads(tmp_path, monkey
                 "hotel my-hotel kosmo-web --upload logo_url=/etc/passwd",
                 "system-prompt my-hotel -o /tmp/out.md",
                 "hotel my-hotel knowledge source upload ../kosmi_two/secret.md",
+                "skills edit my-hotel my-hotel/pets --content-file=/data/repo/.env.production",
+                "hotel my-hotel kosmo-web --upload=logo_url=/etc/passwd",
+                "hotel my-hotel kosmo-web --upload logo_url=https://169.254.169.254/latest/meta-data",
+                "system-prompt my-hotel --output=/tmp/out.md",
+                # Only the page argument of website read is a page; a later positional path is still a file.
+                "hotel my-hotel website read /rooms /etc/passwd",
+                "hotel my-hotel knowledge /etc/passwd",
             ):
                 assert "error" in json.loads(kosmo_cloud_tool.kosmo_cli({"command": command})), command
         assert len(calls) == 1
@@ -244,3 +251,77 @@ def test_shell_snapshots_never_capture_the_caller_token(tmp_path):
         kosmo_cli_access_token.reset(token)
     assert "snapshot-caller-token" not in snapshot.read_text()
     assert "KOSMO_CLI_AUTH_ACCESS_TOKEN" not in _make_run_env({"KOSMO_CLI_AUTH_ACCESS_TOKEN": "stale"})
+
+
+def test_kosmo_cli_tool_passes_site_paths_text_and_attached_images(tmp_path):
+    """Site paths, URLs and free text that start with "/" are arguments, not files; values reach the CLI intact."""
+    import shlex
+
+    from gateway.session_context import kosmo_cli_restricted_hotel_slugs
+    from tools import kosmo_cloud_tool
+
+    uploads = tmp_path / "api-attachments" / "kosmi_one"
+    uploads.mkdir(parents=True)
+    logo = uploads / "logo.png"
+    logo.write_bytes(b"png")
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        return subprocess_result(0, "Updated knowledge skill 1 (my-hotel/pets).\n", "")
+
+    multi_line = "/rooms: two lines\n\nsecond \"quoted\" paragraph"
+    token = kosmo_cli_access_token.set("caller-jwt")
+    scope = kosmo_cli_restricted_hotel_slugs.set(("my-hotel",))
+    root = kosmo_attachment_root.set(str(uploads))
+    try:
+        with patch("tools.kosmo_cloud_tool.subprocess.run", side_effect=fake_run):
+            for command in (
+                "hotel my-hotel website read /apartments/",
+                "hotel my-hotel website read /apartments/ --colors",
+                "hotel my-hotel sources refresh /de/zimmer",
+                "hotel my-hotel knowledge source 12 --include /apartments/ --exclude /blog/",
+                "hotel my-hotel sources 12 --url /rooms",
+                "skills patch my-hotel my-hotel/pets --old '/old text' --new " + shlex.quote(multi_line) + " --description 'Pets, dogs'",
+                f"hotel my-hotel kosmo-web --upload logo_url={logo}",
+            ):
+                result = json.loads(kosmo_cloud_tool.kosmo_cli({"command": command}))
+                assert result.get("exit_code") == 0, (command, result)
+    finally:
+        kosmo_attachment_root.reset(root)
+        kosmo_cli_restricted_hotel_slugs.reset(scope)
+        kosmo_cli_access_token.reset(token)
+    assert len(calls) == 7
+    assert calls[5][4:] == [
+        "skills", "patch", "my-hotel", "my-hotel/pets", "--old", "/old text", "--new", multi_line, "--description", "Pets, dogs",
+    ]
+
+
+def test_kosmo_cli_output_has_no_echoed_command_line(tmp_path, monkeypatch):
+    """A real `bun run --silent` of a package script: multi-line arguments arrive whole and nothing is echoed."""
+    import shutil
+
+    import pytest
+
+    from gateway.session_context import kosmo_cli_restricted_hotel_slugs
+    from tools import kosmo_cloud_tool
+
+    if not shutil.which("bun"):
+        pytest.skip("bun is not installed")
+    (tmp_path / "package.json").write_text(json.dumps({"name": "fake", "scripts": {"kosmo-cli": "bash -lc 'bun run cli.ts \"$@\"' --"}}))
+    (tmp_path / "cli.ts").write_text('console.log("Updated knowledge skill 1."); console.error(JSON.stringify(process.argv.slice(2))); process.exit(process.argv.includes("fail") ? 1 : 0);\n')
+    monkeypatch.setenv("HERMES_CWD", str(tmp_path))
+    token = kosmo_cli_access_token.set("caller-jwt")
+    scope = kosmo_cli_restricted_hotel_slugs.set(("my-hotel",))
+    try:
+        for extra, code in (("", 0), (" fail", 1)):
+            command = 'skills patch my-hotel my-hotel/pets --old "a" --new "line one\n\nline two" --description "D"' + extra
+            result = json.loads(kosmo_cloud_tool.kosmo_cli({"command": command}))
+            assert result["exit_code"] == code
+            lines = [line for line in result["output"].splitlines() if line]
+            assert lines[0] == "Updated knowledge skill 1."
+            assert json.loads(lines[1])[:8] == ["skills", "patch", "my-hotel", "my-hotel/pets", "--old", "a", "--new", "line one\n\nline two"]
+            assert len(lines) == 2, result["output"]
+    finally:
+        kosmo_cli_restricted_hotel_slugs.reset(scope)
+        kosmo_cli_access_token.reset(token)
