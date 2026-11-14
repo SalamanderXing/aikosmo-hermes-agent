@@ -221,6 +221,8 @@ def test_kosmo_cli_tool_only_accepts_this_conversations_uploads(tmp_path, monkey
                 "knowledge sources add-file my-hotel .env.production",
                 "hotel my-hotel kosmo-email imap --request-file .env.production",
                 "hotel my-hotel kosmo-email template add --request-file=docs/notes.md",
+                "hotel my-hotel knowledge spa --diff x/../../../../data/repo/private",
+                "hotel my-hotel knowledge spa --save=../../escape",
             ):
                 assert "error" in json.loads(kosmo_cloud_tool.kosmo_cli({"command": command})), command
         assert len(calls) == 1
