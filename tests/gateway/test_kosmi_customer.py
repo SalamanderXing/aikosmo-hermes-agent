@@ -172,6 +172,13 @@ def test_kosmo_cli_tool_only_accepts_this_conversations_uploads(tmp_path, monkey
     from gateway.session_context import kosmo_cli_restricted_hotel_slugs
     from tools import kosmo_cloud_tool
 
+    # kosmo-cli runs in the repo: a bare or relative name is a file there, not in the gateway's cwd.
+    repo = tmp_path / "repo"
+    (repo / "docs").mkdir(parents=True)
+    (repo / ".env.production").write_text("SECRET=1")
+    (repo / "docs" / "notes.md").write_text("internal")
+    monkeypatch.setenv("HERMES_CWD", str(repo))
+
     uploads = tmp_path / "api-attachments" / "kosmi_one"
     uploads.mkdir(parents=True)
     own = uploads / "rules.md"
@@ -209,6 +216,11 @@ def test_kosmo_cli_tool_only_accepts_this_conversations_uploads(tmp_path, monkey
                 # Only the page argument of website read is a page; a later positional path is still a file.
                 "hotel my-hotel website read /rooms /etc/passwd",
                 "hotel my-hotel knowledge /etc/passwd",
+                "hotel my-hotel knowledge source upload .env.production",
+                "hotel my-hotel sources add-file docs/notes.md",
+                "knowledge sources add-file my-hotel .env.production",
+                "hotel my-hotel kosmo-email imap --request-file .env.production",
+                "hotel my-hotel kosmo-email template add --request-file=docs/notes.md",
             ):
                 assert "error" in json.loads(kosmo_cloud_tool.kosmo_cli({"command": command})), command
         assert len(calls) == 1
