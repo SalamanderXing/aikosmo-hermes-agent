@@ -160,7 +160,9 @@ _KOSMO_CLI_PASSTHROUGH_ENV = (
     "KOSMO_CLI_STAFF_API_BASE_URL",
 )
 # Flags whose value kosmo-cli reads (or, for -o, writes) as a local file.
-_PATH_FLAGS = {"--content-file", "--value-file", "--answer-file", "--question-file", "--upload", "-o", "--output"}
+_PATH_FLAGS = {
+    "--content-file", "--value-file", "--answer-file", "--question-file", "--request-file", "--upload", "-o", "--output",
+}
 _OUTPUT_FLAGS = {"-o", "--output"}
 # Flags whose value is free text, a page URL or a site path, never a local file: `--new "/rooms ..."` or
 # `--include /apartments/` must not be mistaken for a file reference.
@@ -179,15 +181,27 @@ def _kosmo_cli_repo() -> str:
     return os.environ.get("HERMES_CWD") or os.environ.get("KOSMO_CLI_REPO", "/data/repo")
 
 
+_FLAG = re.compile(r"^--?[A-Za-z]")
+
+
 def _split_inline_flag(token: str) -> list[str]:
     """`--content-file=/x` is `--content-file /x` to the CLI's parsers, so the guard reads it the same way."""
-    if token.startswith("-") and "=" in token and re.match(r"^--?[A-Za-z]", token):
+    if "=" in token and _FLAG.match(token):
         return token.split("=", 1)
     return [token]
 
 
-def _kosmo_cli_reject_paths(argv: list[str], attachment_root: str | None) -> str | None:
-    """Only this conversation's uploads may be referenced as local files."""
+def _names_local_file(cwd: str, token: str) -> bool:
+    """A bare word the CLI would open as a file (`upload .env.production`) from its working directory."""
+    joined = os.path.join(cwd, token)
+    return os.path.isfile(joined) or os.path.islink(joined)
+
+
+def _kosmo_cli_reject_paths(argv: list[str], attachment_root: str | None, cwd: str) -> str | None:
+    """Only this conversation's uploads may be referenced as local files.
+
+    Relative paths resolve against `cwd`, the directory kosmo-cli runs in, as the CLI itself resolves them.
+    """
     allowed_root = Path(attachment_root).resolve() if attachment_root else None
     tokens = [part for token in argv for part in _split_inline_flag(token)]
     website_page = 4 if tokens[:1] == ["hotel"] and tuple(tokens[2:4]) in _WEBSITE_PAGE_COMMANDS else None
@@ -200,11 +214,11 @@ def _kosmo_cli_reject_paths(argv: list[str], attachment_root: str | None) -> str
             candidate = token.split("=", 1)[1] if previous == "--upload" and "=" in token else token
         elif previous in _TEXT_FLAGS or index == website_page:
             continue
-        elif token.startswith(("/", "./", "../", "~")):
+        elif token.startswith(("/", "./", "../", "~")) or (not _FLAG.match(token) and _names_local_file(cwd, token)):
             candidate = token
         else:
             continue
-        path = Path(candidate).expanduser()
+        path = Path(cwd, Path(candidate).expanduser())
         try:
             resolved = path.resolve()
         except (OSError, RuntimeError):
@@ -258,10 +272,10 @@ def kosmo_cli(args, **kwargs):
         return json.dumps({"error": "Give the kosmo-cli command to run, e.g. `hotel <slug> knowledge`."})
     if any("\x00" in token_ for token_ in argv):
         return json.dumps({"error": "Invalid command."})
-    rejection = _kosmo_cli_reject_paths(argv, kosmo_attachment_root.get())
+    repo = _kosmo_cli_repo()
+    rejection = _kosmo_cli_reject_paths(argv, kosmo_attachment_root.get(), repo)
     if rejection:
         return json.dumps({"error": rejection})
-    repo = _kosmo_cli_repo()
     with tempfile.TemporaryDirectory(prefix="kosmi-customer-cli-") as home:
         try:
             completed = subprocess.run(
