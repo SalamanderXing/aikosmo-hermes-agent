@@ -69,7 +69,7 @@ registry.register(
     toolset="kosmo-cloud-customer",
     schema={
         "name": "cloud_read",
-        "description": "Read your accessible AI Kosmo properties, a property's basic information, or the first page of its saved knowledge. Never changes data. Ask which property when unclear.",
+        "description": "Read your AI Kosmo properties, one property's details, or its saved knowledge. Knowledge returns its first page. Never changes data. Ask which property when unclear.",
         "parameters": {
             "type": "object",
             "properties": {
