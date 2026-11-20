@@ -260,20 +260,18 @@ class GatewayPluginInjectionMixin:
                            plugin_id, target)
         return authorized
 
-    def _plugin_committed_source_authorized(self, entry, *, plugin_id: str, target: str) -> bool:
-        """AI Kosmo: under a session authority the turn runs as the route's committed source
-        (``snapshot_automation``), not ``entry.origin``; that speaker must pass today's authorization too,
-        or a T3 completion would run as a member whose access was revoked after their last turn."""
-        from gateway.session_authorities import active_authority
-        authority = active_authority(self)
-        if authority is None:
-            return True
+    def _plugin_committed_source_authorized(self, authority, session_key: str, *, plugin_id: str) -> bool:
+        """AI Kosmo: a messaging wake runs as the route's committed source (``snapshot_automation``
+        borrows it), not as the stored or supplied origin; that speaker must pass today's authorization
+        too, or a T3 completion would run as a member whose access was revoked after their last turn."""
         from gateway.session_automation import wake_route_envelope
         from gateway.session_envelope import restore_native
         from persistence.core.errors import AuthorityRefusal
-        envelope = wake_route_envelope(authority, entry)
+        entry = self.session_store.lookup_by_session_key(session_key)
+        envelope = wake_route_envelope(authority, entry) if entry is not None else None
         if envelope is None:
             return True  # nothing committed yet: snapshot_automation refuses the admission itself
+        target = f"session={session_key}"
         try:
             committed = restore_native({'text': '', 'native_text_v1': {
                 key: value for key, value in envelope.items() if key != 'media'}}, self).source
@@ -371,9 +369,6 @@ class GatewayPluginInjectionMixin:
         # Both lanes below answer through this adapter: warm a Relay's egress routing first.
         prime_revived_egress(adapter, event)
         async with self._plugin_injection_scope(source):
-            # Inside the route's profile scope: the committed source is read from that profile's ledger.
-            if not self._plugin_committed_source_authorized(entry, plugin_id=plugin_id, target=f"session={session_key}"):
-                return False
             admitted = await self._admit_plugin_injection(
                 adapter, source, session_key=session_key, session_id=entry.session_id,
                 content=content, plugin_id=plugin_id)
@@ -528,6 +523,9 @@ class GatewayPluginInjectionMixin:
         authority = active_authority(self)
         if authority is None:
             return None
+        if source.platform != Platform.LOCAL and not self._plugin_committed_source_authorized(
+                authority, session_key, plugin_id=plugin_id):
+            return False
         import json
         import uuid
         from persistence.core.errors import AuthorityRefusal

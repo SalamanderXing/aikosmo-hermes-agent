@@ -109,7 +109,11 @@ async def test_a_revoked_committed_speaker_is_refused(monkeypatch):
     assert await runner._dispatch_plugin_message_injection(
         session_key=key, content='[T3 STATE EVENT] completed', plugin_id='t3-events',
         expected_session_id=entry.session_id) is False
+    # The origin path too: the supplied sender (42) is allowed, the committed one (43) is not.
+    assert await runner._dispatch_plugin_origin_injection(
+        source=first, content='[T3 STATE EVENT] by origin', plugin_id='t3-events') is False
     assert ('[T3 STATE EVENT] completed', True) not in executed
+    assert ('[T3 STATE EVENT] by origin', True) not in executed
 
 
 @pytest.mark.asyncio
