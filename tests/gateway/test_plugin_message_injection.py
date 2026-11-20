@@ -469,9 +469,6 @@ async def test_under_a_session_authority_injection_enters_the_durable_fifo(monke
     runner = _runner(entry, adapter)
     authority = SimpleNamespace(admit_automation=AsyncMock())
     monkeypatch.setattr(authorities, "active_authority", lambda _runner: authority)
-    # The route's committed human source (a real authority's ledger: test_kosmi_t3_events_committed_source).
-    monkeypatch.setattr(runner, "_plugin_committed_route_source",
-                        lambda _authority, routed, plugin_id: routed.origin)
 
     assert await runner._dispatch_plugin_message_injection(
         session_key=entry.session_key, content="check the deployment", plugin_id="notify-plugin") is True
@@ -506,10 +503,10 @@ async def test_t3_outbox_returns_to_exact_session_through_real_gateway(tmp_path)
     adapter = SimpleNamespace(handle_message=AsyncMock())
     runner = _runner(entry, adapter)
     runner._running_agents = {}
-    runner._session_db = SimpleNamespace(
-        get_session=AsyncMock(return_value={'id': entry.session_id, 'ended_at': None}),
-        get_compression_tip=AsyncMock(return_value=entry.session_id),
-    )
+    # The owner check reads the store (covered by the completion-delivery tests); the tip is this session.
+    runner._classify_completion_target = AsyncMock(return_value='deliver')
+    runner.session_store.persistence = SimpleNamespace(
+        aio=SimpleNamespace(lineage=SimpleNamespace(tip=AsyncMock(return_value=entry.session_id))))
     path = tmp_path / 'events.sqlite'
     receipt = {'threadId': 't3-test', 'dispatchId': 'dispatch-test', 'messageId': 'message-test', 'previousTurnId': 'old', 'turnId': 'new'}
     assert t3_events.register(receipt, {

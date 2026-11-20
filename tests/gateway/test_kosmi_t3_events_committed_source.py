@@ -77,13 +77,13 @@ async def test_t3_completion_reaches_a_drifted_auto_thread(monkeypatch):
     from gateway.session_automation import snapshot_automation
     from gateway.platforms.event import MessageEvent, MessageType
     from gateway.session_identity import replace_source
-    from hermes_state_runtime import RuntimeStoreError
     stale = MessageEvent(text='x', message_type=MessageType.TEXT, internal=True, message_id='probe',
                          source=replace_source(runner._restored_source(entry)),
                          metadata={'gateway_session_key': key, 'gateway_session_id': entry.session_id})
-    with pytest.raises(RuntimeStoreError) as refused:
-        snapshot_automation(authority, adapter, stale, 'probe')
-    assert refused.value.reason == 'admission_conflict'  # the stored origin alone is refused
+    # Upstream (v0.23): the drifted stored origin only names the route; the wake is admitted as the
+    # route's last committed human source.
+    snapshot, _entry = snapshot_automation(authority, adapter, stale, 'probe')
+    assert snapshot['native_text_v1']['source']['user_id'] == '43'
 
     assert await runner._dispatch_plugin_message_injection(
         session_key=key, content='[T3 STATE EVENT] completed', plugin_id='t3-events',
@@ -129,6 +129,8 @@ async def test_t3_outbox_event_is_delivered_into_a_drifted_auto_thread(monkeypat
         subscription = dict(db.execute('SELECT * FROM subscriptions').fetchone())
     t3_events.observe(subscription, {'reason': 'settled', 'turn': 'completed', 'turnId': 'new',
                                     'lastAssistant': 'PR opened, checks running'}, path)
+    # A busy session keeps the event pending (t3_events never steers a running turn): wait for 'A' to settle.
+    await async_wait_until(lambda: key not in runner._running_agents, timeout=15, what="turn 'A' to settle")
     await t3_events.deliver_pending(runner, path)
     assert t3_events.pending(path) == []
     with t3_events.connect(path) as db:
