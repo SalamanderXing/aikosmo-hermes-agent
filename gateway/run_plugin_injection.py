@@ -354,8 +354,6 @@ class GatewayPluginInjectionMixin:
             return False
         if not self._plugin_injection_authorized(source, plugin_id=plugin_id, target=f"session={session_key}"):
             return False
-        if not self._plugin_committed_source_authorized(entry, plugin_id=plugin_id, target=f"session={session_key}"):
-            return False
 
         adapter = self._delivery_adapter_for(source)
         if adapter is None:
@@ -373,6 +371,9 @@ class GatewayPluginInjectionMixin:
         # Both lanes below answer through this adapter: warm a Relay's egress routing first.
         prime_revived_egress(adapter, event)
         async with self._plugin_injection_scope(source):
+            # Inside the route's profile scope: the committed source is read from that profile's ledger.
+            if not self._plugin_committed_source_authorized(entry, plugin_id=plugin_id, target=f"session={session_key}"):
+                return False
             admitted = await self._admit_plugin_injection(
                 adapter, source, session_key=session_key, session_id=entry.session_id,
                 content=content, plugin_id=plugin_id)
