@@ -17,6 +17,17 @@ KEY = "cloud-probe-owned-secret"
 CUSTOMER_TOOLS = ["cloud_read", "cloud_read_attachment", "kosmo_cli"]
 
 
+def _rows(authority, sql, params=()):
+    """Raw ``session_admissions`` reads for assertions (the SQLite holder upstream tests use)."""
+    from tests.fixtures.storage_holder import raw_holder
+    return raw_holder(authority.persistence)._read_all(sql, params)
+
+
+def _messages(authority, session_id):
+    """The session's active transcript as stored rows."""
+    return [m.as_wire_row() for m in authority.persistence.messages.read_transcript(session_id)]
+
+
 def test_cloud_runs_identity_customer_runtime_text_and_restart(tmp_path):
     repo = Path(__file__).resolve().parents[2]
     work = tmp_path / "work"
@@ -114,7 +125,7 @@ async def probe(peer):
     auth = {"Authorization": f"Bearer {KEY}"}
 
     def admissions():
-        return authority.db._read_all("SELECT request_id, status, payload_json FROM session_admissions")
+        return _rows(authority, "SELECT request_id, status, payload_json FROM session_admissions")
 
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60)) as client:
         async def start(path, body, headers=auth, expect=202):
@@ -167,7 +178,7 @@ async def probe(peer):
             "input": [{"role": "user", "content": [{"type": "input_text", "text": "IMAGE_TURN look"},
                                                    {"type": "input_image", "image_url": f"data:image/png;base64,{png}"}]}]}))
         assert pictured["status"] == "completed", pictured
-        user_rows = [m for m in authority.db.get_messages("staff-image") if m["role"] == "user"]
+        user_rows = [m for m in _messages(authority, "staff-image") if m["role"] == "user"]
         stored = user_rows[-1]["content"]
         stored = json.loads(stored) if isinstance(stored, str) and stored.startswith("[") else stored
         assert isinstance(stored, list), user_rows
@@ -207,7 +218,7 @@ async def probe(peer):
                                                       "input": f"REF_PROBE @file:{Path.cwd() / 'staff-private.txt'}", **extra}))
             assert ref_run["status"] == "completed", ref_run
             inlined = "STAFF_PRIVATE_REF_SENTINEL" in json.dumps([r["messages"] for r in peer.requests[before:]])
-            stored = "STAFF_PRIVATE_REF_SENTINEL" in json.dumps(authority.db.get_messages(f"refs-{lane}"))
+            stored = "STAFF_PRIVATE_REF_SENTINEL" in json.dumps(_messages(authority, f"refs-{lane}"))
             assert (inlined, stored) == ((False, False) if lane == "customer" else (True, True)), (lane, inlined, stored)
 
         # Customer runtime: the effective tools and system prompt the model receives.
@@ -222,7 +233,7 @@ async def probe(peer):
         customer = await finish(customer_id)
         assert customer["status"] == "completed" and "HTTP_UPLOAD_CONTENT" in customer["output"], customer
         # The customer's image survives into SessionDB too (its agent's platform is cloud_customer).
-        stored = next(m for m in authority.db.get_messages("customer-one") if m["role"] == "user")["content"]
+        stored = next(m for m in _messages(authority, "customer-one") if m["role"] == "user")["content"]
         stored = json.loads(stored) if isinstance(stored, str) and stored.startswith("[") else stored
         assert "data:image/png" in json.dumps(stored), stored
         customer_requests = [r for r in peer.requests if "READ_UPLOAD" in json.dumps(r["messages"])]
@@ -275,7 +286,7 @@ async def recover(peer):
     # committed runtime, never as staff.
     kosmi_cloud.register(kept, kosmi_cloud.CloudCredential("erin-token", ("my-hotel",), None))
     recover_api_turns(adapter)
-    interrupted = authority.db._read_all("SELECT status, outcome FROM session_admissions WHERE request_id=?", (running,))[0]
+    interrupted = _rows(authority, "SELECT status, outcome FROM session_admissions WHERE request_id=?", (running,))[0]
     assert (interrupted["status"], interrupted["outcome"]) == ("terminal", "interrupted"), dict(interrupted)
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60)) as client:
         # The interrupted conversation is not paused behind its lost turn: the next message runs.
@@ -293,10 +304,10 @@ async def recover(peer):
             await asyncio.sleep(0.05)
         assert resumed["status"] == "completed", resumed
     def terminal(run_id):
-        rows = authority.db._read_all("SELECT status FROM session_admissions WHERE request_id=?", (run_id,))
+        rows = _rows(authority, "SELECT status FROM session_admissions WHERE request_id=?", (run_id,))
         return rows and rows[0]["status"] == "terminal"
     await async_wait_until(lambda: terminal(lost) and terminal(kept), timeout=60, what="the recovered turns")
-    outcome = {run_id: authority.db._read_all("SELECT outcome FROM session_admissions WHERE request_id=?", (run_id,))[0]["outcome"]
+    outcome = {run_id: _rows(authority, "SELECT outcome FROM session_admissions WHERE request_id=?", (run_id,))[0]["outcome"]
                for run_id in (lost, kept)}
     assert not any("LOST_TURN" in json.dumps(r["messages"]) for r in peer.requests), "a turn without its credential never ran"
     kept_tools = sorted({t["function"]["name"] for r in peer.requests if "KEPT_TURN" in json.dumps(r["messages"])

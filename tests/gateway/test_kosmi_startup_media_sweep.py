@@ -13,7 +13,11 @@ import pytest
 from gateway.config import Platform
 from gateway.run import GatewayRunner
 from gateway.session_api_turn import admit_api_turn
-from gateway.session_ingress_media import _history_mentions, _media_root, collect_unheld_api_images
+from gateway.session_ingress_media import _media_root, collect_unheld_api_images
+from persistence.conversation.messages import NewMessage
+from persistence.sqlite.authority._admission_media import _history_mentions
+from tests.fixtures.storage_holder import raw_holder
+from tests.fixtures.storage_seed import seed_session
 from gateway.session_runtime_workers import join_authority_work, mutation_tasks
 
 
@@ -30,9 +34,9 @@ def _plant(*digests, name=None):
 
 
 def _note(owner, session_id, content):
-    if owner.db.get_session(session_id) is None:
-        owner.db.create_session(session_id, source='cli')
-    owner.db.append_message(session_id, 'user', content)
+    if owner.persistence.sessions.get(session_id) is None:
+        seed_session(owner.persistence, session_id, 'cli')
+    owner.persistence.messages.append(session_id, NewMessage(role='user', content=content))
 
 
 async def _settled(owner):
@@ -74,7 +78,7 @@ def test_prefiltered_scan_still_finds_every_spelling(api, owner):
     _note(owner, 'keeper', json.dumps({'note': f'{escaped}/{escaped_path.name}'}))
     _note(owner, 'keeper', json.dumps({'note': f'C:\\cache\\{back}\\{back_path.name}'}))
     _note(owner, 'keeper', f'the directory {decoy} alone')
-    collect_unheld_api_images(owner.db)
+    collect_unheld_api_images(owner.persistence)
     assert raw_path.exists() and escaped_path.exists() and back_path.exists()
     assert not orphan_path.exists() and not decoy_path.exists()
 
@@ -86,7 +90,7 @@ def test_scan_without_a_common_name_prefix_has_no_prefilter(owner):
     references = [{'path': f'/m/{"a" * 64}/alpha.png', 'sha256': 'a' * 64},
                   {'path': f'/m/{"b" * 64}/beta.png', 'sha256': 'b' * 64},
                   {'path': f'/m/{"c" * 64}/gamma.png', 'sha256': 'c' * 64}]
-    with owner.db._read_ctx() as conn:
+    with raw_holder(owner.persistence)._read_ctx() as conn:
         assert _history_mentions(conn, references) == {references[0]['path'], references[1]['path']}
         assert _history_mentions(conn, references, after_id=1) == {references[1]['path']}
 

@@ -377,6 +377,10 @@ class AdmissionRepository(Protocol):
         """Payloads of the signed webhook ingress admissions for ``chat_id``: ``native_text_v1.source`` names the chat on platform ``webhook`` and carries no ``automation``."""
         ...
 
+    def webhook_ingress_admissions(self, *, chat_id: str) -> list[AdmissionRecord]:
+        """AI Kosmo: the rows ``webhook_ingress_payloads`` reads for ``chat_id``, whole and in ``seq`` order (a shared thread chat holds one per delivery)."""
+        ...
+
     def unfinalized_webhook_admissions(self) -> list[str]:
         """Ids of terminal webhook ingress admissions with a generation whose ``webhook`` session has not ended."""
         ...

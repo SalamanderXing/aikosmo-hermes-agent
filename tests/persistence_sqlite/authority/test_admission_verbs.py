@@ -232,6 +232,7 @@ _READS = {
     "has_pending": lambda a, v: a.has_pending(session_ids=("s1",)),
     "ledger_busy": lambda a, v: a.ledger_busy("s1", "s1"),
     "webhook_ingress_payloads": lambda a, v: a.webhook_ingress_payloads(chat_id="c"),
+    "webhook_ingress_admissions": lambda a, v: a.webhook_ingress_admissions(chat_id="c"),
     "unfinalized_webhook_admissions": lambda a, v: a.unfinalized_webhook_admissions(),
     "terminal_ids": lambda a, v: a.terminal_ids([v["first"]["admission_id"]] * 600),
     "api_compaction_candidates": lambda a, v: a.api_compaction_candidates(),

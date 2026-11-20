@@ -12,6 +12,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import time
 
 import pytest
 
@@ -20,6 +21,12 @@ ROOT = "c0000000-0000-4000-8000-000000000001"
 ISSUE = "a0000000-0000-4000-8000-0000000000aa"
 OTHER_ISSUE = "a0000000-0000-4000-8000-0000000000bb"
 D = {n: f"{n}0000000-0000-4000-8000-00000000000{n}" for n in "123456789"}
+
+
+def _rows(authority, sql, params=()):
+    """Raw ``session_admissions`` reads for assertions (the SQLite holder upstream tests use)."""
+    from tests.fixtures.storage_holder import raw_holder
+    return raw_holder(authority.persistence)._read_all(sql, params)
 GATE = """import json, sys
 payload = json.load(sys.stdin)
 if payload.get("retry"):
@@ -73,7 +80,7 @@ async def test_concurrent_thread_deliveries_each_commit_their_own_destination():
         assert await asyncio.gather(first, second) == ["accepted", "accepted"]
         triggers = {row["request_id"]: json.loads(row["payload_json"])["native_text_v1"]["webhook_delivery"]
                     ["deliver_extra"]["trigger"]
-                    for row in authority.db._read_all("SELECT request_id, payload_json FROM session_admissions")}
+                    for row in _rows(authority, "SELECT request_id, payload_json FROM session_admissions")}
         assert triggers == {D["1"]: "mention", D["2"]: "assigned"}
         assert await _admit(adapter, D["1"], "mention") == "duplicate"
     finally:
@@ -142,7 +149,7 @@ async def test_a_ledgered_answer_is_redelivered_under_its_own_comment_id(monkeyp
     monkeypatch.setattr(webhook_linear, "_linear_graphql", linear)
     try:
         await _admit(adapter, D["1"], "mention")
-        (row,) = authority.db._read_all("SELECT payload_json FROM session_admissions")
+        (row,) = _rows(authority, "SELECT payload_json FROM session_admissions")
         source = restore_native(json.loads(row["payload_json"]), runner).source
         session_key = runner._session_key_for_source(source)
         turn_id = '["plugin","t3-events","k","event-one"]'
@@ -151,16 +158,10 @@ async def test_a_ledgered_answer_is_redelivered_under_its_own_comment_id(monkeyp
                                                       reply_to=None)
         assert not result.success and len(attempts) == 1
         oid = delivery_ledger.compute_obligation_id(session_key, turn_id, "T3 final answer")
-        # What the ledger kept for this answer (a live owner's row: the runtime/boot sweeps claim it the same way).
-        conn = delivery_ledger._connect()
-        try:
-            (stored_ref,) = conn.execute("SELECT reply_ref FROM delivery_obligations WHERE obligation_id=?",
-                                         (oid,)).fetchone()
-        finally:
-            conn.close()
-        assert stored_ref == attempts[0]["id"], "the obligation records the id the answer was attempted under"
-        claimed = [delivery_ledger._claimed_row(oid, session_key, "webhook", source.chat_id, None, "T3 final answer",
-                                                1, "default", needs_marker=True, reply_ref=stored_ref)]
+        # The ledger's own runtime sweep claims the failed answer back with the id it was attempted under.
+        claimed = delivery_ledger.sweep_failed_for_runtime("webhook", now=time.time() + 3600)
+        assert [(row["obligation_id"], row.get("reply_ref")) for row in claimed] == [(oid, attempts[0]["id"])], \
+            "the obligation records the id the answer was attempted under"
         outage["on"] = False
         assert await runner._redeliver_claimed_obligations(claimed) == 1
         assert len(attempts) == 2 and attempts[1]["id"] == attempts[0]["id"], attempts
@@ -213,7 +214,7 @@ async def probe(peer):
     runner, authority, adapter, port, tiers = await gateway(peer, posted)
 
     def rows(request_id):
-        return authority.db._read_all(
+        return _rows(authority,
             "SELECT target_session_id, status FROM session_admissions WHERE request_id=?", (request_id,))
 
     async def post(client, delivery_id, *, text, author="member", thread=ROOT, issue=ISSUE, trigger="mention",
@@ -250,7 +251,7 @@ async def probe(peer):
         assert [c["body"] for c in posted] == ["ANSWER TAG-one", "ANSWER TAG-two"]
         assert all(c["issueId"] == ISSUE and c["parentId"] == ROOT for c in posted)
         thread_sid = first["target_session_id"]
-        assert authority.db.get_session(thread_sid)["ended_at"] is None, "a thread session outlives its turns"
+        assert authority.persistence.sessions.get(thread_sid).ended_at is None, "a thread session outlives its turns"
         thread_chat = f"webhook:linear-comment:thread-{ROOT}"
         assert {tuple(t) for c, t in tiers if c == thread_chat} == {("memory", "todo")} or \
             {tuple(sorted(t)) for c, t in tiers if c == thread_chat} == {("memory", "todo")}
@@ -264,7 +265,7 @@ async def probe(peer):
         assert third["target_session_id"] != thread_sid
         assert [t for c, t in tiers if c == one_shot] and all(t == ["todo"] for c, t in tiers if c == one_shot)
         assert posted[-1]["id"] == D["3"] and posted[-1]["issueId"] == OTHER_ISSUE
-        assert authority.db.get_session(third["target_session_id"])["ended_at"] is not None
+        assert authority.persistence.sessions.get(third["target_session_id"]).ended_at is not None
 
         # Silence: a mention is owed an answer; an assignment-only wake is not.
         await post(client, D["4"], text="SAY_NOTHING")

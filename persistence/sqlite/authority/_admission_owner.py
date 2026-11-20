@@ -43,6 +43,7 @@ __all__ = [
     "pending_targets",
     "terminal_ids",
     "unfinalized_webhook_admissions",
+    "webhook_ingress_admissions",
     "webhook_ingress_payloads",
 ]
 
@@ -321,6 +322,16 @@ def webhook_ingress_payloads(holder, chat_id):
           AND json_extract(payload_json, '$.native_text_v1.source.platform')='webhook'
           AND json_extract(payload_json, '$.native_text_v1.automation') IS NULL"""
     return [json.loads(row['payload_json']) for row in holder._read_all(query, (chat_id,))]
+
+
+def webhook_ingress_admissions(holder, chat_id):
+    # AI Kosmo: whole rows of ``webhook_ingress_payloads``, in seq order.
+    query = """SELECT * FROM session_admissions
+        WHERE json_extract(payload_json, '$.native_text_v1.source.chat_id')=?
+          AND json_extract(payload_json, '$.native_text_v1.source.platform')='webhook'
+          AND json_extract(payload_json, '$.native_text_v1.automation') IS NULL
+        ORDER BY seq"""
+    return [_row(row) for row in holder._read_all(query, (chat_id,))]
 
 
 # Settled webhook ingress admissions whose session is still open.

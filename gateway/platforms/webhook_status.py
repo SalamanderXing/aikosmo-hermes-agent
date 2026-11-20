@@ -21,11 +21,6 @@ logger = logging.getLogger(__name__)
 FEEDBACK_ROUTE = "auto-demo"
 _WIRE_STATUS = {"queued": "accepted", "started": "running", "terminal": "ended", "unknown": "ended"}
 _FEEDBACK_IMAGE_TYPES = {"image/png", "image/jpeg", "image/webp", "image/gif"}
-# Only the signed ingress admission is the delivery; later automation rows on its chat are not.
-_DELIVERY_ROWS = """SELECT admission_id FROM session_admissions
-    WHERE request_id=? AND principal_id LIKE 'messaging:%'
-      AND json_extract(payload_json, '$.native_text_v1.source.platform')='webhook'
-      AND json_extract(payload_json, '$.native_text_v1.automation') IS NULL"""
 
 
 class FeedbackRefused(ValueError):
@@ -42,21 +37,24 @@ def _webhook_adapter(runner):
 
 
 def find_delivery(runner, delivery_id: str):
-    """``(authority, admission row, route name)`` of one delivery on a ``durable_status`` route, else None
-    (unknown id, a route that does not expose status, or an id two admissions share)."""
+    """``(authority, admission record, route name)`` of one delivery on a ``durable_status`` route, else None
+    (unknown id, a route that does not expose status, or an id two admissions share). Only the signed
+    ingress admission is the delivery; later automation rows on its chat are not."""
+    from gateway.platforms.api_server_store import authority_store
     from gateway.platforms.webhook import _WebhookDeliveryIdentity
     from gateway.session_authorities import serving_authorities
-    from hermes_state_runtime import get_session_admission
     adapter = _webhook_adapter(runner)
     if adapter is None or not delivery_id:
         return None
     found = []
     for authority in serving_authorities(runner):
-        for candidate in authority.db._read_all(_DELIVERY_ROWS, (delivery_id,)):
-            row = get_session_admission(authority.db, admission_id=candidate["admission_id"])
-            if row is None:
+        for row in authority_store(authority).admissions.match(request_id=delivery_id):
+            envelope = row.payload.get("native_text_v1") or {}
+            source = envelope.get("source") or {}
+            if (not row.principal_id.startswith("messaging:") or source.get("platform") != "webhook"
+                    or envelope.get("automation") is not None):
                 continue
-            route = _WebhookDeliveryIdentity.route_from_chat_id(row["payload"]["native_text_v1"]["source"]["chat_id"])
+            route = _WebhookDeliveryIdentity.route_from_chat_id(source["chat_id"])
             config = adapter._routes.get(route)
             if isinstance(config, dict) and config.get("durable_status") is True:
                 found.append((authority, row, route))
@@ -68,31 +66,38 @@ def delivery_status(runner, delivery_id: str) -> Optional[dict[str, Any]]:
     found = find_delivery(runner, delivery_id)
     if found is None:
         return None
+    from gateway.platforms.api_server_store import authority_store
+    from persistence.conversation.messages import TranscriptRead
     authority, row, route = found
-    sid, status = row["target_session_id"], row["status"]
-    session = authority.db.get_session(sid) or {}
+    store = authority_store(authority)
+    sid, status = row.target_session_id, row.status.value
+    session = store.sessions.get(sid)
     started_at = None
     if status != "queued":
-        first = authority.db._read_all("SELECT MIN(timestamp) AS at FROM messages WHERE session_id=?", (sid,))
-        started_at = first[0]["at"] if first else None
+        first = store.messages.read_transcript(sid, TranscriptRead(limit=1))
+        started_at = first[0].timestamp if first else None
     ended = status in ("terminal", "unknown")
     return {
         "delivery_id": delivery_id, "route": route, "status": _WIRE_STATUS[status], "session_id": sid,
-        "accepted_at": session.get("started_at"), "started_at": started_at,
-        "ended_at": session.get("ended_at") if ended else None,
-        "end_reason": row["outcome"] if status == "terminal" else "unknown_execution" if status == "unknown" else None,
+        "accepted_at": session.started_at if session else None, "started_at": started_at,
+        "ended_at": session.ended_at if ended and session else None,
+        "end_reason": row.outcome if status == "terminal" else "unknown_execution" if status == "unknown" else None,
     }
 
 
 def delivery_transcript(runner, delivery_id: str):
-    """``(session row, messages)`` of an auto-demo delivery's conversation (its compression tip), else None."""
+    """``(session row, message rows)`` of an auto-demo delivery's conversation (its compression tip), else None."""
+    from gateway.platforms.api_server import _session_row
+    from gateway.platforms.api_server_store import authority_store
     found = find_delivery(runner, delivery_id)
     if found is None or found[2] != FEEDBACK_ROUTE:
         return None
-    authority = found[0]
-    sid = authority.db.get_compression_tip(found[1]["target_session_id"]) or found[1]["target_session_id"]
-    session = authority.db.get_session(sid)
-    return None if session is None else (session, authority.db.get_messages(sid))
+    store = authority_store(found[0])
+    sid = store.lineage.tip(found[1].target_session_id)
+    session = store.sessions.get(sid)
+    if session is None:
+        return None
+    return _session_row(session), [message.as_wire_row() for message in store.messages.read_transcript(sid)]
 
 
 def _decode_image(part: dict) -> tuple[str, bytes]:
@@ -139,25 +144,25 @@ async def run_feedback(runner, delivery_id: str, content: Any) -> dict[str, Any]
     """Run one operator-feedback turn in an auto-demo delivery's original session and wait for it: a
     webhook admission on the delivery's chat with its retained destination, so the authority orders it
     behind the delivery's own turn and finalization closes the session again afterwards."""
+    from gateway.platforms.api_server_store import authority_store
     from gateway.session_envelope import restore_native
-    from hermes_state_runtime import get_session_admission
     found = await asyncio.to_thread(find_delivery, runner, delivery_id)
     if found is None or found[2] != FEEDBACK_ROUTE:
         raise FeedbackRefused("Delivery not found", 404)
     authority, row, _route = found
-    if row["status"] == "unknown":
+    if row.status == "unknown":
         raise FeedbackRefused("The delivery's turn was lost in a restart; its session is paused", 409)
     adapter = _webhook_adapter(runner)
-    envelope = row["payload"]["native_text_v1"]
-    source = restore_native(row["payload"], runner).source
+    envelope = row.payload["native_text_v1"]
+    source = restore_native(dict(row.payload), runner).source
+    store = authority_store(authority)
     try:
-        event = await asyncio.to_thread(feedback_event, source, row["target_session_id"], delivery_id, content)
+        event = await asyncio.to_thread(feedback_event, source, row.target_session_id, delivery_id, content)
     except ValueError as exc:
         raise FeedbackRefused(str(exc).split(":", 1)[-1], 400) from exc
     finalized = await adapter.admit_followup(
-        event, dict(envelope["webhook_delivery"]), lambda: authority.db.reopen_session(row["target_session_id"]))
+        event, dict(envelope["webhook_delivery"]), lambda: store.sessions.reopen(row.target_session_id))
     if finalized is not None:
         await asyncio.shield(finalized)
-    rows = authority.db._read_all("SELECT admission_id FROM session_admissions WHERE request_id=?", (event.message_id,))
-    settled = get_session_admission(authority.db, admission_id=rows[0]["admission_id"]) if rows else None
-    return {"delivery_id": delivery_id, "status": settled["outcome"] if settled else "consumed"}
+    settled = await asyncio.to_thread(store.admissions.match, request_id=event.message_id)
+    return {"delivery_id": delivery_id, "status": (settled[0].outcome if settled else None) or "consumed"}

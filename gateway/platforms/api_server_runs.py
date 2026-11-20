@@ -933,10 +933,9 @@ def _run_pending(self, run_id: str) -> bool:
     if run_id in self._active_run_tasks:
         return True
     from gateway.platforms.api_server_authority_runs import run_admission
-    from hermes_state_runtime import RuntimeStoreError
     try:
         owned = run_admission(self, run_id)
-    except RuntimeStoreError:
+    except AuthorityRefusal:
         return True  # an ambiguous ledger answer keeps the credential; the run decides
     return owned is not None and owned[1]["status"] in ("queued", "started")
 

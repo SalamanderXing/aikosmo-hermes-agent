@@ -226,6 +226,10 @@ class SQLiteAdmissionRepository:
         with refused():
             return owner.webhook_ingress_payloads(self._store.holder(), chat_id)
 
+    def webhook_ingress_admissions(self, *, chat_id: str) -> list[AdmissionRecord]:
+        with refused():
+            return [_record(row) for row in owner.webhook_ingress_admissions(self._store.holder(), chat_id)]
+
     def unfinalized_webhook_admissions(self) -> list[str]:
         with refused():
             return owner.unfinalized_webhook_admissions(self._store.holder())

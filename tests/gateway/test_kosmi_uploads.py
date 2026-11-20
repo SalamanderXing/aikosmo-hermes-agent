@@ -6,17 +6,19 @@ import shutil
 import pytest
 
 from gateway.platforms.api_server import APIServerAdapter, _stage_session_file_parts
-from hermes_state import SessionDB
 from tests.agent.test_run_agent import agent
+from tests.fixtures.storage_read import conversation, transcript_rows
+from tests.fixtures.storage_seed import seed_session
 from tools.file_tools import read_file_tool
 
 
 @pytest.mark.parametrize("platform", ["api_server", "discord"])
 def test_image_flush_reload_and_client_projection(agent, tmp_path, platform):
-    db = SessionDB(db_path=tmp_path / "uploads.db")
-    db.create_session("upload-history", source=platform)
+    from persistence_assembly import open_persistence, profile_scope
+    store = open_persistence(profile_scope(home=tmp_path))
+    seed_session(store, "upload-history", platform)
     agent.platform = platform
-    agent._session_db = db
+    agent._session_db = agent.persistence = store
     agent._session_db_created = True
     agent.session_id = "upload-history"
     content = [
@@ -25,14 +27,14 @@ def test_image_flush_reload_and_client_projection(agent, tmp_path, platform):
     ]
     try:
         agent._flush_messages_to_session_db([{"role": "user", "content": content}], [])
-        rows = db.get_messages("upload-history")
+        rows = transcript_rows(store, "upload-history")
         assert len(rows) == 1
         expected = content if platform == "api_server" else "Read this image\n[screenshot]"
         assert APIServerAdapter._message_response(rows[0])["content"] == expected
-        assert db.get_messages_as_conversation("upload-history")[0]["content"] == expected
+        assert conversation(store, "upload-history")[0]["content"] == expected
     finally:
-        agent._session_db = None
-        db.close()
+        agent._session_db = agent.persistence = None
+        store.close()
 
 
 def test_staged_document_survives_gateway_replacement_and_a_different_tool_directory(tmp_path, monkeypatch):

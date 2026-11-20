@@ -1419,7 +1419,8 @@ class TestWebhookTurnsKeepIntentionalSilence:
             # What execution (and a replay after a restart) runs is the committed admission, not this event.
             from gateway.session_envelope import restore_native
             runner = adapter._message_handler.__self__
-            rows = runner.session_authority.db._read_all("SELECT payload_json FROM session_admissions")
+            from tests.fixtures.storage_holder import raw_holder
+            rows = raw_holder(runner.session_authority.persistence)._read_all("SELECT payload_json FROM session_admissions")
             assert len(rows) == 1
             committed = restore_native(json.loads(rows[0]["payload_json"]), runner)
 

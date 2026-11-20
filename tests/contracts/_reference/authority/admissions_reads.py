@@ -125,6 +125,10 @@ class AdmissionReadsMixin:
                 out.append(rows.record(r).payload)
         return out
 
+    def webhook_ingress_admissions(self, *, chat_id: str) -> list[Any]:
+        return [rows.record(r) for r in rows.rows_by_seq(self._committed())
+                if (source := _webhook_source(r["payload"])) is not None and source.get("chat_id") == chat_id]
+
     def unfinalized_webhook_admissions(self) -> list[str]:
         sessions = self._tables().get("sessions", {})
         out = []

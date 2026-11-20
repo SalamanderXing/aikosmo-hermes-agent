@@ -61,7 +61,7 @@ class ApprovalScopeTest(unittest.TestCase):
         source = SessionSource(platform=Platform.WEBHOOK, chat_id='webhook:auto-demo:thread-review',
                                user_id='webhook:auto-demo')
         runner = SimpleNamespace(_adapter_for_source=lambda source: adapter)
-        ctx = SimpleNamespace(source=source, session_id='same-session')
+        ctx = SimpleNamespace(source=source, session_id='same-session', session_key='agent:main:webhook:review')
         a = agent()
         turn = TurnRunner(runner, ctx)
         def run_codex():

@@ -60,12 +60,6 @@ THREAD_CHAT_PREFIX = "thread-"
 # the delivery id of a comment turn, or a producer identity for a turn the gateway started.
 replying_turn: ContextVar = ContextVar("webhook_replying_turn", default=None)
 
-_SIGNED_ROWS = """SELECT request_id, payload_json FROM session_admissions
-    WHERE json_extract(payload_json, '$.native_text_v1.source.chat_id')=?
-      AND json_extract(payload_json, '$.native_text_v1.source.platform')='webhook'
-      AND json_extract(payload_json, '$.native_text_v1.automation') IS NULL
-    ORDER BY seq"""
-
 
 def route_tier_toolsets(route_config: dict, tier: Any) -> Optional[list[str]]:
     """The toolsets of a route's named tier, or None (the route's own ``toolsets``): an unknown tier, a
@@ -105,7 +99,9 @@ def _signed_rows(adapter, chat_id: str) -> list:
     runner = adapter.gateway_runner or getattr(adapter._message_handler, "__self__", None)
     scoped = active_authority(runner)
     candidates = [scoped] if scoped is not None else serving_authorities(runner)
-    return [row for authority in candidates for row in authority.db._read_all(_SIGNED_ROWS, (chat_id,))]
+    from gateway.platforms.api_server_store import authority_store
+    return [record for authority in candidates
+            for record in authority_store(authority).admissions.webhook_ingress_admissions(chat_id=chat_id)]
 
 
 def turn_destination(adapter, chat_id: str, turn=None) -> dict:
@@ -124,16 +120,16 @@ def turn_destination(adapter, chat_id: str, turn=None) -> dict:
                               str(getattr(turn, "message_id", "") or ""))
     rows = _signed_rows(adapter, chat_id)
     if not rows:
-        from hermes_state_runtime import RuntimeStoreError
-        raise RuntimeStoreError("not_found")
+        from persistence import AuthorityRefusal
+        raise AuthorityRefusal("not_found")
     message_id = str(getattr(turn, "message_id", "") or "")
-    own = next((row for row in rows if row["request_id"] == message_id), None)
+    own = next((row for row in rows if row.request_id == message_id), None)
     row = own or rows[-1]
-    destination = checked_destination(adapter, chat_id, json.loads(row["payload_json"]))
+    destination = checked_destination(adapter, chat_id, row.payload)
     # A gateway-started turn is one new answer: a reply id of its own, derived from the turn's own identity
     # so every attempt to deliver that answer (a retry, a redelivery) converges on one comment; no turn
     # identity, no idempotency key, no post.
-    return _with_reply_id(destination, own["request_id"] if own else _derived_reply_id(message_id))
+    return _with_reply_id(destination, own.request_id if own else _derived_reply_id(message_id))
 
 
 def _derived_reply_id(turn_id: str) -> str:
@@ -153,7 +149,7 @@ def thread_tier(adapter, chat_id: str) -> Optional[str]:
     """A thread chat's toolset tier: its newest delivery's. The route script keys a shared session only
     for staff authors, so every delivery of one thread carries the same tier."""
     rows = _signed_rows(adapter, chat_id)
-    delivery = json.loads(rows[-1]["payload_json"])["native_text_v1"].get("webhook_delivery") if rows else None
+    delivery = rows[-1].payload["native_text_v1"].get("webhook_delivery") if rows else None
     return (delivery or {}).get("toolset_tier")
 
 

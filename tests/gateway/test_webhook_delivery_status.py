@@ -155,18 +155,22 @@ async def probe(peer):
             await async_wait_until(lambda: (delivery_status(runner, "auto-demo-2-200") or {}).get("status") == "ended",
                                    timeout=30, what="the second delivery to settle")
             second_sid = delivery_status(runner, "auto-demo-2-200")["session_id"]
-            real_reopen, loop = authority.db.reopen_session, asyncio.get_running_loop()
+            from gateway.platforms.api_server_store import authority_store
+            sessions = authority_store(authority).sessions
+            real_reopen, loop = sessions.reopen, asyncio.get_running_loop()
 
             def reopen_then_release_close(session_id):
                 real_reopen(session_id)
                 loop.call_soon_threadsafe(gate.set)
                 time.sleep(0.3)  # without the close lock, finalization closes the session right here
-            authority.db.reopen_session = reopen_then_release_close
+            sessions.reopen = reopen_then_release_close
             raced = await run_feedback(runner, "auto-demo-2-200", "race feedback")
-            authority.db.reopen_session, adapter._end_webhook_session = real_reopen, real_end
+            del sessions.reopen
+            adapter._end_webhook_session = real_end
             assert raced["status"] == "completed"
-            (row,) = authority.db._read_all("SELECT target_session_id FROM session_admissions WHERE request_id LIKE ?",
-                                            ("auto-demo-2-200:feedback:%",))
+            from tests.fixtures.storage_holder import raw_holder
+            (row,) = raw_holder(authority.persistence)._read_all(
+                "SELECT target_session_id FROM session_admissions WHERE request_id LIKE ?", ("auto-demo-2-200:feedback:%",))
             assert row["target_session_id"] == second_sid, "feedback rotated into a fresh session"
 
             # A feedback request cancelled while the authority reserves its route, with the delivery's own
@@ -185,9 +189,9 @@ async def probe(peer):
             await async_wait_until(lambda: (delivery_status(runner, "auto-demo-3-300") or {}).get("status") == "ended",
                                    timeout=30, what="the third delivery to settle")
             _authority, delivered, _route = find_delivery(runner, "auto-demo-3-300")
-            third_sid = delivered["target_session_id"]
-            source = restore_native(delivered["payload"], runner).source
-            destination = dict(delivered["payload"]["native_text_v1"]["webhook_delivery"])
+            third_sid = delivered.target_session_id
+            source = restore_native(dict(delivered.payload), runner).source
+            destination = dict(delivered.payload["native_text_v1"]["webhook_delivery"])
             entered, proceed = threading.Event(), threading.Event()
             real_reserve = authority._reserve_route
 
@@ -198,7 +202,7 @@ async def probe(peer):
             authority._reserve_route = held_reserve
             cancelled = asyncio.create_task(adapter.admit_followup(
                 feedback_event(source, third_sid, "auto-demo-3-300", "cancelled feedback"), destination,
-                lambda: authority.db.reopen_session(third_sid)))
+                lambda: sessions.reopen(third_sid)))
             assert await asyncio.to_thread(entered.wait, 15)
             cancelled.cancel()
             try:
@@ -211,7 +215,7 @@ async def probe(peer):
             authority._reserve_route, adapter._end_webhook_session = real_reserve, real_end
             await async_wait_until(lambda: not adapter._background_tasks, timeout=30, what="the cancelled feedback")
             await run_feedback(runner, "auto-demo-3-300", "after a cancelled request")
-            targets = {r["target_session_id"] for r in authority.db._read_all(
+            targets = {r["target_session_id"] for r in raw_holder(authority.persistence)._read_all(
                 "SELECT target_session_id FROM session_admissions WHERE request_id LIKE ?", ("auto-demo-3-300%",))}
             assert targets == {third_sid}, targets
 

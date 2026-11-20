@@ -12,7 +12,7 @@ from gateway.config import PlatformConfig
 from gateway.platforms import webhook_linear
 from gateway.platforms.webhook import WebhookAdapter
 from gateway.platforms.webhook_delivery import validate_destination
-from hermes_state_runtime import RuntimeStoreError
+from persistence import AuthorityRefusal
 
 DELIVERY = "7c3f1a6e-5b2d-4f8a-9c41-2e6b8d0a1f34"
 ISSUE = "1eba60c7-9663-427c-b313-d588f33c77a8"
@@ -143,7 +143,7 @@ def test_the_destination_persists_only_the_ids_the_sender_reads():
     # Other destinations are byte-identical to upstream's (retry fingerprints): no tier key appears.
     assert validate_destination({"deliver": "log", "deliver_extra": {}}) == {"deliver": "log", "deliver_extra": {}}
     for bad in ({"issue_id": 7}, {"trigger": ["x"]}):
-        with pytest.raises(RuntimeStoreError):
+        with pytest.raises(AuthorityRefusal):
             validate_destination({"deliver": "linear_comment", "deliver_extra": bad})
 
 
