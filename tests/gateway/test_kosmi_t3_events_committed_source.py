@@ -94,6 +94,25 @@ async def test_t3_completion_reaches_a_drifted_auto_thread(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_a_revoked_committed_speaker_is_refused(monkeypatch):
+    """The wake runs as the route's last committed speaker: one whose access was revoked since is
+    refused, even while the thread's original speaker is still allowed."""
+    runner, adapter, authority, executed = await _thread_gateway(monkeypatch)
+    original = 'Guild / #daniele-kosmi / revoked speaker'
+    first = _thread_source(adapter, user_id='42', user_name='Daniele', chat_name=original)
+    await _human(adapter, executed, first, 'A', 'A')
+    await _human(adapter, executed, _thread_source(adapter, user_id='43', user_name='Giulio', chat_name=original),
+                 'B', 'B')
+    key = runner.session_store._generate_session_key(first)
+    entry = runner.session_store.lookup_by_session_key(key)
+    monkeypatch.setenv('DISCORD_ALLOWED_USERS', '42')
+    assert await runner._dispatch_plugin_message_injection(
+        session_key=key, content='[T3 STATE EVENT] completed', plugin_id='t3-events',
+        expected_session_id=entry.session_id) is False
+    assert ('[T3 STATE EVENT] completed', True) not in executed
+
+
+@pytest.mark.asyncio
 async def test_keyed_injection_without_a_committed_human_turn_is_refused(monkeypatch):
     runner, adapter, authority, executed = await _thread_gateway(monkeypatch)
     from gateway.session import SessionSource

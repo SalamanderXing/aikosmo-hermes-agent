@@ -67,14 +67,15 @@ def delivery_status(runner, delivery_id: str) -> Optional[dict[str, Any]]:
     if found is None:
         return None
     from gateway.platforms.api_server_store import authority_store
-    from persistence.conversation.messages import TranscriptRead
+    from persistence.conversation.messages import TranscriptRead, TranscriptView
     authority, row, route = found
     store = authority_store(authority)
     sid, status = row.target_session_id, row.status.value
     session = store.sessions.get(sid)
     started_at = None
     if status != "queued":
-        first = store.messages.read_transcript(sid, TranscriptRead(limit=1))
+        # The session's first stored row, archived or rewound ones included (compaction keeps the start).
+        first = store.messages.read_transcript(sid, TranscriptRead(view=TranscriptView.ALL, limit=1))
         started_at = first[0].timestamp if first else None
     ended = status in ("terminal", "unknown")
     return {

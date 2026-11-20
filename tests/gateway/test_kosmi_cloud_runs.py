@@ -121,6 +121,15 @@ async def probe(peer):
 
     home = Path(os.environ["HERMES_HOME"])
     os.environ["KOSMO_CLI_AUTH_ACCESS_TOKEN"] = "stale-global-token"  # process env must never be the identity
+    # Every agent the gateway builds, by session: an idle API session retires (v0.23), so its live agent
+    # may be gone by the time the assertions below inspect it.
+    import run_agent
+    built, real_init = {}, run_agent.AIAgent.__init__
+
+    def recording_init(self, *args, **kwargs):
+        real_init(self, *args, **kwargs)
+        built[kwargs.get("session_id") or getattr(self, "session_id", None)] = self
+    run_agent.AIAgent.__init__ = recording_init
     _runner, authority, _adapter, base = await start_gateway("cloud-1")
     auth = {"Authorization": f"Bearer {KEY}"}
 
@@ -245,8 +254,7 @@ async def probe(peer):
         assert "STAFF_SOUL_SENTINEL" in staff_prompts, "control: a staff turn does see the staff SOUL"
         assert "STAFF_ENVIRONMENT_HINT_SENTINEL" in staff_prompts, "control: a staff turn sees the host hint"
         assert str(home) not in prompts, "a customer prompt names no host path or profile home"
-        from gateway.session_contract import SessionRef
-        agent = authority.agent(SessionRef("default", "customer-one"))
+        agent = built["customer-one"]
         assert agent.platform == "cloud_customer" and agent.max_iterations == 40
         assert agent._memory_enabled is False and agent._user_profile_enabled is False
         assert agent._memory_manager is None and agent.skip_background_review is True

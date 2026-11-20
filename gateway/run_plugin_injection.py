@@ -260,6 +260,29 @@ class GatewayPluginInjectionMixin:
                            plugin_id, target)
         return authorized
 
+    def _plugin_committed_source_authorized(self, entry, *, plugin_id: str, target: str) -> bool:
+        """AI Kosmo: under a session authority the turn runs as the route's committed source
+        (``snapshot_automation``), not ``entry.origin``; that speaker must pass today's authorization too,
+        or a T3 completion would run as a member whose access was revoked after their last turn."""
+        from gateway.session_authorities import active_authority
+        authority = active_authority(self)
+        if authority is None:
+            return True
+        from gateway.session_automation import wake_route_envelope
+        from gateway.session_envelope import restore_native
+        from persistence.core.errors import AuthorityRefusal
+        envelope = wake_route_envelope(authority, entry)
+        if envelope is None:
+            return True  # nothing committed yet: snapshot_automation refuses the admission itself
+        try:
+            committed = restore_native({'text': '', 'native_text_v1': {
+                key: value for key, value in envelope.items() if key != 'media'}}, self).source
+        except AuthorityRefusal as exc:
+            logger.warning("Plugin message injection refused: plugin=%s %s committed source did not restore (%s)",
+                           plugin_id, target, exc.reason)
+            return False
+        return self._plugin_injection_authorized(committed, plugin_id=plugin_id, target=target)
+
     def _plugin_session_key_admissible(self, session_key: str, *, plugin_home: Optional[Path], plugin_id: str) -> bool:
         """Synchronous refusal of a keyed injection into another profile's session (local or
         messaging), so the plugin gets ``False``; an unknown key is decided at dispatch, as before.
@@ -330,6 +353,8 @@ class GatewayPluginInjectionMixin:
         if not self._plugin_messaging_session_owned(session_key, plugin_home=plugin_home, plugin_id=plugin_id):
             return False
         if not self._plugin_injection_authorized(source, plugin_id=plugin_id, target=f"session={session_key}"):
+            return False
+        if not self._plugin_committed_source_authorized(entry, plugin_id=plugin_id, target=f"session={session_key}"):
             return False
 
         adapter = self._delivery_adapter_for(source)
