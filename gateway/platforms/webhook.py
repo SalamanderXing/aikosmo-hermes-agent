@@ -379,7 +379,8 @@ class WebhookAdapter(BasePlatformAdapter):
                 and (metadata or {}).get("notify") is not True and posts_commentary(self, chat_id)):
             # AI Kosmo: a staff thread's interim commentary is a comment of its own (status notices
             # carry no commentary marker and stay dropped below).
-            return await self._deliver_to(commentary_destination(self, chat_id, delivery, content), chat_id, content)
+            return await self._deliver_to(commentary_destination(delivery, content, metadata.get("_turn_id")),
+                                          chat_id, content)
         if delivery["deliver"] == "linear_comment" and (metadata or {}).get("notify") is not True:
             # Only the final answer posts: interim and status sends (fallback-model notices, context-pressure
             # warnings) reach send() too, and the gateway marks finals and only finals as notify.

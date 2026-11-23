@@ -157,20 +157,23 @@ def posts_commentary(adapter, chat_id: str) -> bool:
     try:
         if not is_thread_chat(chat_id) or thread_tier(adapter, chat_id) != "staff":
             return False
-        return turn_destination(adapter, chat_id).get("deliver") == "linear_comment"
+        destination = turn_destination(adapter, chat_id)
+        # An `assigned` wake may end in NO_REPLY (nothing posted): its commentary must not post either.
+        return (destination.get("deliver") == "linear_comment"
+                and (destination.get("deliver_extra") or {}).get("trigger") != "assigned")
     except Exception:
         logger.debug("[webhook] no commentary destination for %s", chat_id, exc_info=True)
         return False
 
 
-def commentary_destination(adapter, chat_id: str, destination: dict, content: str) -> dict:
-    """The destination of one commentary comment: the thread's own, under an id fixed by the thread's
-    newest delivery and the text, so a retried send converges on one comment (no delivery, no id:
-    the sender then refuses to post)."""
-    rows = _signed_rows(adapter, chat_id)
-    anchor = rows[-1].request_id if rows else ""
+def commentary_destination(destination: dict, content: str, turn_id: Any) -> dict:
+    """The destination of one commentary comment: the thread's own, under an id fixed by the producing
+    turn (its inbound message id, carried by the stream consumer as ``_turn_id``) and the text, so a
+    retried send converges on one comment and another turn's identical text is a comment of its own.
+    No turn id, no id: the sender then refuses to post. The same text twice in one turn is one comment."""
+    turn = str(turn_id or "")
     digest = hashlib.sha256(content.strip().encode()).hexdigest()
-    return {**destination, "reply_id": _derived_reply_id(f"commentary:{anchor}:{digest}") if anchor else ""}
+    return {**destination, "reply_id": _derived_reply_id(f"commentary:{turn}:{digest}") if turn else ""}
 
 
 def thread_tier(adapter, chat_id: str) -> Optional[str]:

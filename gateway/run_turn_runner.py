@@ -335,9 +335,14 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                         # callback carrying the final answer participates in final-send dedup.
                         on_missing_cursor="fallback" if want_interim_messages else "raise",
                     )
+                    # AI Kosmo: a webhook turn's sends carry the turn's own id, which keys a staff Linear
+                    # thread's commentary comments (webhook_linear.commentary_destination).
+                    consumer_metadata = ctx._status_thread_metadata
+                    if getattr(ctx.source, "platform", None) == Platform.WEBHOOK and ctx.inbound_message_id:
+                        consumer_metadata = {**(consumer_metadata or {}), "_turn_id": str(ctx.inbound_message_id)}
                     stream_consumer = GatewayStreamConsumer(
                         adapter=adapter, chat_id=ctx.source.chat_id, config=consumer_cfg,
-                        metadata=ctx._status_thread_metadata,
+                        metadata=consumer_metadata,
                         on_new_message=(
                             (lambda: ctx.progress_queue.put(("__reset__",))) if ctx.progress_queue is not None else None
                         ),

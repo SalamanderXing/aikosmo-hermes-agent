@@ -190,15 +190,25 @@ async def test_a_staff_threads_commentary_posts_as_comments_and_status_notices_d
                                                "parentId": match.get("parentId"), "issue": {"id": match["issueId"]}}}}
     monkeypatch.setattr(webhook_linear, "_linear_graphql", linear)
     thread = f"webhook:linear-comment:thread-{ROOT}"
-    commentary = {"_interim_send": True, "_commentary": True}
+    turn_one = {"_interim_send": True, "_commentary": True, "_turn_id": D["1"]}
+    turn_two = {**turn_one, "_turn_id": '["plugin","t3-events","k","event-two"]'}
     try:
         assert await _admit(adapter, D["1"], "assignment") == "accepted"
         assert adapter.posts_commentary(thread) is True
-        assert (await adapter.send(thread, "Reading the issue first.", metadata=commentary)).success
-        assert (await adapter.send(thread, "Reading the issue first.", metadata=commentary)).success
+        assert (await adapter.send(thread, "Reading the issue first.", metadata=turn_one)).success
+        assert (await adapter.send(thread, "Reading the issue first.", metadata=turn_one)).success  # a retry
         assert (await adapter.send(thread, "Context window 80% full", metadata={"_interim_send": True})).success
-        assert [(c["body"], c["parentId"], c["issueId"]) for c in posted] == [("Reading the issue first.", ROOT, ISSUE)]
-        assert re.fullmatch(webhook_linear._UUID4_RE, posted[0]["id"]) and posted[0]["id"] != D["1"]
+        assert (await adapter.send(thread, "Reading the issue first.", metadata=turn_two)).success  # another turn
+        assert (await adapter.send(thread, "No turn id", metadata={**turn_one, "_turn_id": None})).success is False
+        assert [(c["body"], c["parentId"], c["issueId"]) for c in posted] == [
+            ("Reading the issue first.", ROOT, ISSUE), ("Reading the issue first.", ROOT, ISSUE)]
+        assert len({c["id"] for c in posted}) == 2 and D["1"] not in {c["id"] for c in posted}
+        assert all(re.fullmatch(webhook_linear._UUID4_RE, c["id"]) for c in posted)
+        # An `assigned` wake may end in NO_REPLY, so nothing of it may post early.
+        assert await _admit(adapter, D["3"], "assigned") == "accepted"
+        assert adapter.posts_commentary(thread) is False
+        assert (await adapter.send(thread, "Thinking about it", metadata={**turn_one, "_turn_id": D["3"]})).success
+        assert len(posted) == 2
         # A member's one-shot delivery is not a staff thread: final answers only.
         member = {"issue": OTHER_ISSUE, "parent": ROOT, "trigger": "mention"}
         assert await adapter._admit_agent_run(member, "comment", D["2"], 0.0, route_config=ROUTE,
