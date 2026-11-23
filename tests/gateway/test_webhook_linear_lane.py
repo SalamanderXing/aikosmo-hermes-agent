@@ -170,6 +170,92 @@ async def test_a_ledgered_answer_is_redelivered_under_its_own_comment_id(monkeyp
         await adapter.disconnect()
 
 
+@pytest.mark.asyncio
+async def test_a_staff_threads_commentary_posts_as_comments_and_status_notices_do_not(monkeypatch):
+    """Giulio, 2026-11-23: every message Kosmi writes in a staff Linear thread lands on the issue. Interim
+    commentary (marked by the stream consumer) posts under the thread root with an id fixed by the thread's
+    newest delivery and the text; a status notice (interim, unmarked) and a one-shot delivery stay final-only."""
+    from gateway.platforms import webhook_linear
+    _runner, authority, adapter, _port, _tiers = await gateway(None, [])
+    authority._schedule = lambda ref: None
+    monkeypatch.setenv("LINEAR_API_KEY", "lin_test_key")
+    posted = []
+
+    def linear(query, variables, api_key):
+        if "commentCreate" in query:
+            posted.append(dict(variables["input"]))
+            return {"data": {"commentCreate": {"success": True}}}
+        match = next((c for c in posted if c["id"] == variables["id"]), None)
+        return {"data": {"comment": match and {"id": match["id"], "body": match["body"],
+                                               "parentId": match.get("parentId"), "issue": {"id": match["issueId"]}}}}
+    monkeypatch.setattr(webhook_linear, "_linear_graphql", linear)
+    thread = f"webhook:linear-comment:thread-{ROOT}"
+    turn_one = {"_interim_send": True, "_commentary": True, "_turn_id": D["1"]}
+    turn_two = {**turn_one, "_turn_id": '["plugin","t3-events","k","event-two"]'}
+    try:
+        assert await _admit(adapter, D["1"], "assignment") == "accepted"
+        assert adapter.posts_commentary(thread) is True
+        assert (await adapter.send(thread, "Reading the issue first.", metadata=turn_one)).success
+        assert (await adapter.send(thread, "Reading the issue first.", metadata=turn_one)).success  # a retry
+        assert (await adapter.send(thread, "Context window 80% full", metadata={"_interim_send": True})).success
+        assert (await adapter.send(thread, "Reading the issue first.", metadata=turn_two)).success  # another turn
+        assert (await adapter.send(thread, "No turn id", metadata={**turn_one, "_turn_id": None})).success is False
+        assert [(c["body"], c["parentId"], c["issueId"]) for c in posted] == [
+            ("Reading the issue first.", ROOT, ISSUE), ("Reading the issue first.", ROOT, ISSUE)]
+        assert len({c["id"] for c in posted}) == 2 and D["1"] not in {c["id"] for c in posted}
+        assert all(re.fullmatch(webhook_linear._UUID4_RE, c["id"]) for c in posted)
+        # An `assigned` wake may end in NO_REPLY, so nothing of it may post early.
+        assert await _admit(adapter, D["3"], "assigned") == "accepted"
+        assert adapter.posts_commentary(thread) is False
+        # Not posted, and reported as not delivered: the consumer must not count it, or an identical final
+        # answer would be suppressed as already sent.
+        assert not (await adapter.send(thread, "Thinking about it", metadata={**turn_one, "_turn_id": D["3"]})).success
+        assert len(posted) == 2
+        # A member's one-shot delivery is not a staff thread: final answers only.
+        member = {"issue": OTHER_ISSUE, "parent": ROOT, "trigger": "mention"}
+        assert await adapter._admit_agent_run(member, "comment", D["2"], 0.0, route_config=ROUTE,
+                                              route_name="linear-comment", profile=None, event_type="Comment") == "accepted"
+        from gateway.platforms.webhook import _WebhookDeliveryIdentity
+        one_shot = _WebhookDeliveryIdentity.from_parts(None, "linear-comment", D["2"]).session_chat_id
+        assert adapter.posts_commentary(one_shot) is False
+        assert adapter.posts_commentary("webhook:auto-demo:thread-x") is False
+    finally:
+        await adapter.disconnect()
+
+
+def test_a_route_can_carry_its_own_rate_limit():
+    """AI Kosmo: the Linear route also takes every Issue update of Kosmi's teams, so it gets a larger budget
+    of its own (route ``rate_limit``) without raising every other route's ceiling."""
+    from gateway.config import PlatformConfig
+    from gateway.platforms.webhook import WebhookAdapter
+    adapter = WebhookAdapter(PlatformConfig(enabled=True, extra={"routes": {}, "rate_limit": 2}))
+    now = time.time()
+    assert [adapter._record_rate_limit_hit("linear-comment", now, 3) for _ in range(4)] == [True, True, True, False]
+    assert [adapter._record_rate_limit_hit("auto-demo", now) for _ in range(3)] == [True, True, False]
+    assert [adapter._record_rate_limit_hit("other", now, "x") for _ in range(3)] == [True, True, False]
+
+
+def test_only_an_adapter_that_posts_commentary_turns_it_on_for_a_webhook_turn():
+    """run_turn's gate: a webhook turn gets interim commentary only from ``posts_commentary`` returning True,
+    looked up on the class (a MagicMock adapter answers every attribute and must stay off)."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    from gateway.run_turn import webhook_posts_commentary
+
+    class Posts:
+        def posts_commentary(self, chat_id):
+            return chat_id == "thread"
+
+    class Broken:
+        def posts_commentary(self, chat_id):
+            raise RuntimeError("no authority")
+    assert webhook_posts_commentary(Posts(), "thread") is True
+    assert webhook_posts_commentary(Posts(), "one-shot") is False
+    assert webhook_posts_commentary(MagicMock(), "thread") is False
+    assert webhook_posts_commentary(SimpleNamespace(), "thread") is False
+    assert webhook_posts_commentary(Broken(), "thread") is False
+
+
 async def gateway(peer, posted):
     from gateway.config import Platform, PlatformConfig
     from gateway.platforms.webhook import WebhookAdapter

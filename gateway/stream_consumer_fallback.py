@@ -543,6 +543,8 @@ class StreamFallbackMixin:
             # with interim text and orphan the true final.
             _md = self._metadata_for_send(final=False) or {}
             _md["_interim_send"] = True
+            # AI Kosmo: commentary, not a gateway status notice (webhook_linear.COMMENTARY_KEY).
+            _md["_commentary"] = True
             # reply_to only for reply-anchored threading; Discord/Telegram use
             # thread_id metadata and reply_to on every commentary is spam.
             _plat = getattr(getattr(self.adapter, "platform", None), "value", None)
