@@ -55,6 +55,18 @@ logger = logging.getLogger("gateway.run")
 _tool_call_logger_lock = threading.Lock()
 
 
+def webhook_posts_commentary(adapter: Any, chat_id: str) -> bool:
+    """AI Kosmo: a webhook chat gets interim commentary only when its adapter says it posts it (a staff
+    Linear thread, ``WebhookAdapter.posts_commentary``); the display setting must still allow it. Looked up
+    on the class, so a mock adapter (which answers any attribute) stays off."""
+    method = getattr(type(adapter), "posts_commentary", None)
+    try:
+        return callable(method) and method(adapter, chat_id) is True
+    except Exception:
+        logger.debug("posts_commentary failed for a webhook chat", exc_info=True)
+        return False
+
+
 def _tool_call_logger() -> logging.Logger:
     """Process-wide ``hermes.tool_calls`` Logger + one RotatingFileHandler on logs/tool_calls.log.
     Named Loggers live in ``logging.Logger.manager.loggerDict`` forever, so the former per-turn name
@@ -896,7 +908,8 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
         interim_assistant_messages_mode = _display_surface_mode(
             "interim_assistant_messages", default=True, require_platform_override_for={Platform.MATTERMOST},
         )
-        interim_assistant_messages_enabled = not is_webhook and not bot_peer and interim_assistant_messages_mode != "off"
+        interim_assistant_messages_enabled = ((not is_webhook or webhook_posts_commentary(adapter, source.chat_id))
+                                              and not bot_peer and interim_assistant_messages_mode != "off")
         _thinking_enabled = _display_surface_mode(
             "thinking_progress", default=False, require_platform_override_for={Platform.MATTERMOST},
         ) != "off" and not bot_peer

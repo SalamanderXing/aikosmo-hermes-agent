@@ -45,8 +45,9 @@ from gateway.platforms.webhook_filters import DEFAULT_SCRIPT_TIMEOUT_SECONDS, We
 from gateway.platforms.webhook_mcp_events import (
     handle_mcp_event_control, mcp_event_delivery_id, render_mcp_event_prompt)
 from gateway.platforms.webhook_linear import (
-    RETRY_KEY, SESSION_KEY_KEY, TOOLSET_TIER_KEY, deliver_linear_comment, is_thread_chat, replying_turn,
-    route_tier_toolsets, script_routing, silence_replacement, thread_chat_id, thread_tier, turn_destination)
+    COMMENTARY_KEY, RETRY_KEY, SESSION_KEY_KEY, TOOLSET_TIER_KEY, commentary_destination, deliver_linear_comment,
+    is_thread_chat, posts_commentary, replying_turn, route_tier_toolsets, script_routing, silence_replacement,
+    thread_chat_id, thread_tier, turn_destination)
 from gateway.response_filters import is_autonomous_silence_response
 from gateway.webhook_targets import is_dispatchable_target, is_known_platform as _is_known_platform
 
@@ -374,12 +375,21 @@ class WebhookAdapter(BasePlatformAdapter):
                 logger.info("[webhook] Response for %s is a silence marker — not delivering", chat_id)
                 return SendResult(success=True)
             content = replacement
+        if (delivery["deliver"] == "linear_comment" and (metadata or {}).get(COMMENTARY_KEY) is True
+                and (metadata or {}).get("notify") is not True and posts_commentary(self, chat_id)):
+            # AI Kosmo: a staff thread's interim commentary is a comment of its own (status notices
+            # carry no commentary marker and stay dropped below).
+            return await self._deliver_to(commentary_destination(self, chat_id, delivery, content), chat_id, content)
         if delivery["deliver"] == "linear_comment" and (metadata or {}).get("notify") is not True:
             # Only the final answer posts: interim and status sends (fallback-model notices, context-pressure
             # warnings) reach send() too, and the gateway marks finals and only finals as notify.
             logger.debug("[webhook] Skipping non-final send for %s (notify not set)", chat_id)
             return SendResult(success=True)
         return await self._deliver_to(delivery, chat_id, content)
+
+    def posts_commentary(self, chat_id: str) -> bool:
+        """AI Kosmo: whether a turn on ``chat_id`` sends its interim commentary (run_turn asks)."""
+        return posts_commentary(self, chat_id)
 
     def final_reply_ref(self, chat_id: str, turn_id: str) -> Optional[str]:
         """AI Kosmo: a linear_comment answer's comment id, recorded with its delivery-ledger obligation."""
@@ -447,14 +457,15 @@ class WebhookAdapter(BasePlatformAdapter):
             self._seen_deliveries.pop(k, None)
         self._seen_deliveries_next_prune_at = now + min(60.0, max(1.0, self._idempotency_ttl / 10))
 
-    def _record_rate_limit_hit(self, route_name: str, now: float) -> bool:
-        """Return True if route is still within limit after recording this hit."""
+    def _record_rate_limit_hit(self, route_name: str, now: float, limit: Optional[int] = None) -> bool:
+        """Return True if route is still within limit after recording this hit. ``limit``: the route's own
+        ``rate_limit`` (AI Kosmo), else the platform's."""
         if not isinstance(window := self._rate_counts.get(route_name), deque):
             window = self._rate_counts[route_name] = deque(window or ())
         cutoff = now - _RATE_WINDOW_SECONDS
         while window and window[0] < cutoff:
             window.popleft()
-        if len(window) >= self._rate_limit:
+        if len(window) >= (limit if isinstance(limit, int) and limit > 0 else self._rate_limit):
             return False
         window.append(now)
         return True
@@ -789,7 +800,7 @@ class WebhookAdapter(BasePlatformAdapter):
         if error_response is not None:
             return error_response
         # Rate limiting (after auth)
-        if not self._record_rate_limit_hit(route_name, time.time()):
+        if not self._record_rate_limit_hit(route_name, time.time(), route_config.get("rate_limit")):
             return _json_error("Rate limit exceeded", 429)
         payload = self._parse_body(raw_body)
         if payload is _UNPARSEABLE:
