@@ -376,9 +376,13 @@ class WebhookAdapter(BasePlatformAdapter):
                 return SendResult(success=True)
             content = replacement
         if (delivery["deliver"] == "linear_comment" and (metadata or {}).get(COMMENTARY_KEY) is True
-                and (metadata or {}).get("notify") is not True and posts_commentary(self, chat_id)):
+                and (metadata or {}).get("notify") is not True):
             # AI Kosmo: a staff thread's interim commentary is a comment of its own (status notices
-            # carry no commentary marker and stay dropped below).
+            # carry no commentary marker and stay dropped below). Commentary that may not post here now
+            # reports failure, never a silent success: the stream consumer would otherwise count its
+            # text as delivered and suppress an identical final answer.
+            if not posts_commentary(self, chat_id):
+                return SendResult(success=False, error="commentary is not posted on this delivery")
             return await self._deliver_to(commentary_destination(delivery, content, metadata.get("_turn_id")),
                                           chat_id, content)
         if delivery["deliver"] == "linear_comment" and (metadata or {}).get("notify") is not True:

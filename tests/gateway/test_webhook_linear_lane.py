@@ -207,7 +207,9 @@ async def test_a_staff_threads_commentary_posts_as_comments_and_status_notices_d
         # An `assigned` wake may end in NO_REPLY, so nothing of it may post early.
         assert await _admit(adapter, D["3"], "assigned") == "accepted"
         assert adapter.posts_commentary(thread) is False
-        assert (await adapter.send(thread, "Thinking about it", metadata={**turn_one, "_turn_id": D["3"]})).success
+        # Not posted, and reported as not delivered: the consumer must not count it, or an identical final
+        # answer would be suppressed as already sent.
+        assert not (await adapter.send(thread, "Thinking about it", metadata={**turn_one, "_turn_id": D["3"]})).success
         assert len(posted) == 2
         # A member's one-shot delivery is not a staff thread: final answers only.
         member = {"issue": OTHER_ISSUE, "parent": ROOT, "trigger": "mention"}
