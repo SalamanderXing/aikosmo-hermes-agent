@@ -126,3 +126,22 @@ def test_is_unattended_reads_only_the_committed_api_marker():
     assert is_unattended(row({"history": None, "settings": {}, "unattended": True}))
     assert not is_unattended(row({"history": None, "settings": {}}))
     assert not is_unattended(row({"history": None, "settings": {}, "unattended": "true"}))
+
+
+def test_a_lost_cloud_run_keeps_its_own_cancellation_copy(monkeypatch):
+    """Cloud shows its own localized copy for a cancelled run; only other API runs get the error."""
+    from gateway.platforms import api_server_authority_runs as runs
+
+    def projection(payload):
+        row = {"status": "terminal", "outcome": "interrupted", "generation": 1, "admission_id": "a",
+               "target_session_id": "s", "payload": payload}
+        authority = SimpleNamespace(sessions={})
+        monkeypatch.setattr(runs, "run_admission", lambda adapter, run_id: (authority, row))
+        monkeypatch.setattr(runs, "admission_result", lambda store, admission_id: None)
+        monkeypatch.setattr("gateway.platforms.api_server_store.authority_store", lambda authority: None)
+        return runs.run_projection(SimpleNamespace(), "run_x")
+
+    api = projection({"text": "x", "api_turn_v1": {"history": None, "settings": {}, "unattended": True}})
+    assert api["status"] == "cancelled" and api["error"] == LOST_TURN_ERROR
+    cloud = projection({"text": "x", "api_turn_v1": {"history": None, "settings": {"cloud_runtime": "staff"}}})
+    assert cloud["status"] == "cancelled" and "error" not in cloud
