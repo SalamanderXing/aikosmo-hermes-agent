@@ -49,6 +49,11 @@ async def continued_session(adapter, session_id, request_id=None):
         return session_id, store_error_response(_openai_error, exc)
 
 
+# AI Kosmo: the error a run settled from ``unknown`` reports (gateway restart, lost worker).
+LOST_TURN_ERROR = ('Kosmi lost this turn (the gateway restarted or its worker died before it finished); '
+                   'it was not run again.')
+
+
 def run_admission(adapter, run_id):
     authority = _authority(adapter)
     if authority is None:
@@ -98,6 +103,10 @@ def run_projection(adapter, run_id):
     if status == 'failed' and result.get('error'):
         from gateway.platforms.api_server import _redact_api_error_text
         failure = {'error': _redact_api_error_text(result['error'])}
+    elif row['status'] == 'terminal' and row['outcome'] == 'interrupted' and saved is None:
+        # AI Kosmo: settled from ``unknown`` (resolve-unknown, /discard or the unattended settle): the
+        # turn never finished and was not replayed; a poller sees why instead of a bare cancel.
+        failure = {'error': LOST_TURN_ERROR}
     return {**progress, 'pending_controls': pending, 'run_id': run_id, 'status': status, 'session_id': row['target_session_id'],
             'admission_id': row['admission_id'], 'execution_generation': row['generation'],
             'output': result.get('final_response', ''), 'usage': saved.get('usage', {}) if saved else {}, **failure}

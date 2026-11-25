@@ -58,8 +58,9 @@ def check_api_turn(authority, ref, payload):
         # 'browser_control' is accepted and ignored: admissions persisted while the removed
         # browser-extension control existed may carry it and must still recover.
         if (set(data) - {'history', 'settings', 'turn_author', 'media', 'run_owner_scope', 'browser_control',
-                         'relay_metadata', 'resume_unanswered'}
+                         'relay_metadata', 'resume_unanswered', 'unattended'}
                 or data.get('resume_unanswered', True) is not True
+                or data.get('unattended', True) is not True
                 or not {'history', 'settings'} <= set(data)
                 or not isinstance(data.get('relay_metadata', {}), dict)
                 or (data['history'] is not None and not isinstance(data['history'], list))
@@ -189,6 +190,10 @@ def admit_api_steps(adapter, **kwargs):
         # The session-chat door's one policy-gated re-run (#115325): its failed attempt left this text as
         # the transcript's unanswered tail, which the turn adopts instead of appending it again.
         payload['api_turn_v1']['resume_unanswered'] = True
+    if kwargs.get('unattended'):
+        # AI Kosmo: the caller said nobody can resend this turn (a backend job, not a person): a lost
+        # execution settles interrupted instead of pausing the session (``is_unattended``).
+        payload['api_turn_v1']['unattended'] = True
     if kwargs.get('relay_metadata'):
         # The request's Relay metadata rides the admission to the turn it describes (main passed it
         # to ``run_conversation``); it is client JSON, so it is part of the exact-retry identity.

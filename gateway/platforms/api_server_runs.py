@@ -596,6 +596,9 @@ class _RunLaunch:
     turn_author: Optional[dict[str, Any]] = None  # memory-attribution label only; grants nothing
     admission: Any = None
     walked_from: Optional[str] = None  # the swept stored session the chain moved past (``bind_api_steps``)
+    # AI Kosmo: the caller's ``unattended: true`` (nobody can resend this turn): committed with the
+    # admission, so a lost execution settles instead of pausing the session (session_unattended_unknown).
+    unattended: bool = False
 
     @property
     def approval_session_key(self) -> str:
@@ -751,7 +754,7 @@ async def _admit_run_to_authority(
                 history_from_session=session_history_delivery,
                 session_history_delivery='1' if session_history_delivery else '',
                 bind_declared_conversation=_declared_selected, walked_from=launch.walked_from,
-                **launch.agent_kwargs)
+                unattended=launch.unattended, **launch.agent_kwargs)
     except Exception as exc:  # health: allow BLE001 -- answered below; a committed admission is kept
         # A storage failure after the admission committed (a later media-release write) still
         # owns that run: forgetting it would let a keyed retry admit the same work twice.
@@ -799,6 +802,9 @@ async def _handle_runs(self, request: web.Request, *, _api_server) -> web.Respon
             code="invalid_idempotency_key", status=400)
     idempotency_scope, idempotency_fingerprint = _run_idempotency_identity(
         self, request, body, gateway_session_key, idempotency_key)
+    unattended = body.get("unattended", False)
+    if not isinstance(unattended, bool):
+        return _json_error(_openai_error, "'unattended' must be a boolean", code="invalid_params", status=400)
     raw_input = body.get("input")
     user_message, input_err = _run_user_message(raw_input, _openai_error)
     if input_err is not None:
@@ -889,7 +895,8 @@ async def _handle_runs(self, request: web.Request, *, _api_server) -> web.Respon
             **({"cloud_runtime": cloud[0]} if cloud else {}),
             **{k: agent_overrides.get(k) for k in ("requested_model", "requested_provider", "model_options")}),
         request_profile=_api_server._api_request_profile.get(),
-        turn_author=turn_author, walked_from=walked_from if session_id == stored_session_id else None)
+        turn_author=turn_author, walked_from=walked_from if session_id == stored_session_id else None,
+        unattended=unattended)
     # A canonical Bot Chat that a Desktop holds live is that Desktop's to run: executing here would
     # be a second writer beside its lease (#114959). The owner's mailbox takes the turn and its
     # receipt drives this run's status, so `peer run` keeps its run_id and `peer status` still works.

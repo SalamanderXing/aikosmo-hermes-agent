@@ -32,9 +32,13 @@ def is_unattended(row) -> bool:
     # ``SessionAuthority.submit(_kanban_card=...)``; a card row main minted without it still pauses.
     # AI Kosmo: a Cloud turn can never resume after a restart (its caller credential lived only in that
     # process, gateway/kosmi_cloud.py) and Cloud offers no Discard, so it settles like an automation turn.
+    # AI Kosmo: so does a /v1/runs turn its caller marked ``unattended`` (a backend job such as a ticket
+    # analysis polls the run and fails it on its own; nobody would type /discard for it).
     from gateway.kosmi_cloud import is_cloud_admission
+    api_turn = payload.get('api_turn_v1') or {}
     return ('local_automation_v1' in payload or 'kanban_card_v1' in payload
-            or 'automation' in native or 'webhook_delivery' in native or is_cloud_admission(payload))
+            or 'automation' in native or 'webhook_delivery' in native or is_cloud_admission(payload)
+            or api_turn.get('unattended') is True)
 
 
 def _unattended_unknown(records):
